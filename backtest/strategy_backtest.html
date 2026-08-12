@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>策略回测：冰点买入 + 泡沫卖出</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+:root {
+  --bg: #ffffff; --text: #1a1a2e; --text2: #6b7280;
+  --card: #f8f9fa; --border: #e5e7eb;
+  --up: #16a34a; --down: #dc2626;
+  --blue: #2563eb; --blueFill: rgba(37,99,235,0.08);
+  --orange: #ea580c; --orangeFill: rgba(234,88,12,0.08);
+  --green: #16a34a; --red: #dc2626;
+  --grid: rgba(128,128,128,0.15);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f172a; --text: #e2e8f0; --text2: #94a3b8;
+    --card: #1e293b; --border: #334155;
+    --up: #22c55e; --down: #ef4444;
+    --blue: #60a5fa; --blueFill: rgba(96,165,250,0.10);
+    --orange: #fb923c; --orangeFill: rgba(251,146,60,0.10);
+    --green: #4ade80; --red: #f87171;
+    --grid: rgba(148,163,184,0.12);
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f172a; --text: #e2e8f0; --text2: #94a3b8;
+  --card: #1e293b; --border: #334155;
+  --up: #22c55e; --down: #ef4444;
+  --blue: #60a5fa; --blueFill: rgba(96,165,250,0.10);
+  --orange: #fb923c; --orangeFill: rgba(251,146,60,0.10);
+  --green: #4ade80; --red: #f87171;
+  --grid: rgba(148,163,184,0.12);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", sans-serif;
+  background: var(--bg); color: var(--text);
+  padding: 40px 24px; max-width: 1100px; margin: 0 auto;
+}
+h1 { font-size: 28px; font-weight: 700; margin-bottom: 6px; }
+.subtitle { color: var(--text2); font-size: 14px; margin-bottom: 32px; }
+.section {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; padding: 24px; margin-bottom: 28px;
+}
+.section h2 { font-size: 18px; font-weight: 600; margin-bottom: 16px; }
+.stats-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px; margin-bottom: 18px;
+}
+.stat-card {
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px 14px;
+}
+.stat-card .label { font-size: 11px; color: var(--text2); margin-bottom: 4px; }
+.stat-card .value { font-size: 20px; font-weight: 700; }
+.up { color: var(--up); } .down { color: var(--down); }
+.plot-box { width: 100%; height: 480px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 8px 12px; text-align: right; border-bottom: 1px solid var(--border); }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--text2); font-weight: 500; font-size: 11px; }
+tr:last-child td { border-bottom: none; }
+.buy { color: var(--up); font-weight: 600; }
+.sell { color: var(--down); font-weight: 600; }
+.footnote { color: var(--text2); font-size: 12px; margin-top: 24px; text-align: center; }
+</style>
+</head>
+<body>
+
+<h1>🧊 冰点买入 + 泡沫卖出 · 策略回测</h1>
+<p class="subtitle">
+  CSI300估值驱动 + CSI2000流动性动量 · 月频信号 · 冰点score≥50买入 · 泡沫≥2类确认卖出
+  <br>回测区间: 2018-06-01 ~ 2026-08-01 · 生成于 2026-08-12 23:43
+</p>
+
+<!-- 净值图 -->
+<div class="section">
+  <h2>策略净值 vs 基准指数（买入持有）</h2>
+  <div class="stats-grid">
+    <div class="stat-card"><div class="label">策略累计收益</div><div class="value up">+61.67%</div></div>
+    <div class="stat-card"><div class="label">策略年化收益</div><div class="value up">+6.06%</div></div>
+    <div class="stat-card"><div class="label">最大回撤</div><div class="value down">-32.09%</div></div>
+    <div class="stat-card"><div class="label">α vs CSI300</div><div class="value up">+35.67%</div></div>
+    <div class="stat-card"><div class="label">α vs 60/40</div><div class="value up">+27.71%</div></div>
+    <div class="stat-card"><div class="label">交易次数</div><div class="value">13笔</div></div>
+  </div>
+  <div id="chartNav" class="plot-box"></div>
+</div>
+
+<!-- 逐年对比 -->
+<div class="section">
+  <h2>逐年收益对比</h2>
+  <div id="chartYearly" class="plot-box"></div>
+</div>
+
+<!-- 对比表 -->
+<div class="section">
+  <h2>策略 vs 基准 汇总对比</h2>
+  <table>
+    <thead><tr><th>指标</th><th>策略</th><th>CSI300 B&H</th><th>CSI2000 B&H</th><th>60/40 B&H</th></tr></thead>
+    <tbody>
+      <tr><td>累计收益率</td><td style="color:var(--up)">+61.67%</td><td style="color:var(--up)">+26.00%</td><td style="color:var(--up)">+45.90%</td><td style="color:var(--up)">+33.96%</td></tr>
+      <tr><td>年化收益率</td><td>+6.06%</td><td colspan="3">—</td></tr>
+      <tr><td>最大回撤</td><td>-32.09%</td><td colspan="3">—</td></tr>
+      <tr><td>超额收益(α)</td><td>—</td><td>+35.67%</td><td>+15.76%</td><td>+27.71%</td></tr>
+      <tr><td>买入/卖出</td><td>11/2笔</td><td colspan="3">1/0笔</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- 交易记录 -->
+<div class="section">
+  <h2>交易记录</h2>
+  <table>
+    <thead><tr><th>日期</th><th>操作</th><th>标的</th><th>份额</th><th>价格</th><th>金额</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>2018-10-01</td>
+        <td class="buy">买入</td>
+        <td>中证2000</td>
+        <td>15225.52</td>
+        <td>¥1.6420</td>
+        <td>¥25,005</td>
+        <td style="font-size:11px;color:var(--text2)">评分:51.0</td>
+      </tr>
+      <tr>
+        <td>2018-12-01</td>
+        <td class="buy">买入</td>
+        <td>沪深300</td>
+        <td>5909.42</td>
+        <td>¥3.1727</td>
+        <td>¥18,752</td>
+        <td style="font-size:11px;color:var(--text2)">评分:51.0</td>
+      </tr>
+      <tr>
+        <td>2019-03-01</td>
+        <td class="buy">买入</td>
+        <td>中证2000</td>
+        <td>7860.89</td>
+        <td>¥1.7887</td>
+        <td>¥14,063</td>
+        <td style="font-size:11px;color:var(--text2)">评分:74.0</td>
+      </tr>
+      <tr>
+        <td>2019-07-01</td>
+        <td class="buy">买入</td>
+        <td>中证2000</td>
+        <td>5694.92</td>
+        <td>¥1.8516</td>
+        <td>¥10,547</td>
+        <td style="font-size:11px;color:var(--text2)">评分:52.0</td>
+      </tr>
+      <tr>
+        <td>2019-11-01</td>
+        <td class="buy">买入</td>
+        <td>中证2000</td>
+        <td>4462.53</td>
+        <td>¥1.7721</td>
+        <td>¥7,910</td>
+        <td style="font-size:11px;color:var(--text2)">评分:55.0</td>
+      </tr>
+      <tr>
+        <td>2020-02-01</td>
+        <td class="buy">买入</td>
+        <td>中证2000</td>
+        <td>3175.91</td>
+        <td>¥1.8674</td>
+        <td>¥5,932</td>
+        <td style="font-size:11px;color:var(--text2)">评分:59.0</td>
+      </tr>
+      <tr>
+        <td>2020-05-01</td>
+        <td class="buy">买入</td>
+        <td>沪深300</td>
+        <td>1136.77</td>
+        <td>¥3.9126</td>
+        <td>¥4,449</td>
+        <td style="font-size:11px;color:var(--text2)">评分:55.0</td>
+      </tr>
+      <tr>
+        <td>2020-06-01</td>
+        <td class="buy">买入</td>
+        <td>中证2000</td>
+        <td>1720.71</td>
+        <td>¥1.9385</td>
+        <td>¥3,336</td>
+        <td style="font-size:11px;color:var(--text2)">评分:54.0</td>
+      </tr>
+      <tr>
+        <td>2020-09-01</td>
+        <td class="buy">买入</td>
+        <td>中证2000</td>
+        <td>1048.82</td>
+        <td>¥2.3850</td>
+        <td>¥2,502</td>
+        <td style="font-size:11px;color:var(--text2)">评分:74.0</td>
+      </tr>
+      <tr>
+        <td>2020-12-01</td>
+        <td class="buy">买入</td>
+        <td>中证2000</td>
+        <td>836.78</td>
+        <td>¥2.2419</td>
+        <td>¥1,876</td>
+        <td style="font-size:11px;color:var(--text2)">评分:53.0</td>
+      </tr>
+      <tr>
+        <td>2021-03-01</td>
+        <td class="buy">买入</td>
+        <td>中证2000</td>
+        <td>689.28</td>
+        <td>¥2.0411</td>
+        <td>¥1,407</td>
+        <td style="font-size:11px;color:var(--text2)">评分:64.0</td>
+      </tr>
+      <tr>
+        <td>2026-08-01</td>
+        <td class="sell">卖出</td>
+        <td>沪深300</td>
+        <td>3523.09</td>
+        <td>¥4.5882</td>
+        <td>¥16,161</td>
+        <td style="font-size:11px;color:var(--text2)">利差扩大-0.57%/6月; 跌破MA60且MA60拐头(趋势兜底)</td>
+      </tr>
+      <tr>
+        <td>2026-08-01</td>
+        <td class="sell">卖出</td>
+        <td>中证2000</td>
+        <td>20357.68</td>
+        <td>¥3.0733</td>
+        <td>¥62,553</td>
+        <td style="font-size:11px;color:var(--text2)">利差扩大-0.57%/6月; 跌破MA60且MA60拐头(趋势兜底)</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p class="footnote">
+  策略逻辑：冰点检测(score≥50) → 每次用25%现金买入 · 泡沫确认(≥2类触发) → 卖出50%持仓 · 同标的买入冷却90天
+  <br>不含分红和滑点 · 历史表现不代表未来收益 · 数据来源: akshare/csindex/Sina
+</p>
+
+<script>
+const D = {
+  stratDates: ["2018-06-01", "2018-07-01", "2018-08-01", "2018-09-01", "2018-10-01", "2018-11-01", "2018-12-01", "2019-01-01", "2019-02-01", "2019-03-01", "2019-04-01", "2019-05-01", "2019-06-01", "2019-07-01", "2019-08-01", "2019-09-01", "2019-10-01", "2019-11-01", "2019-12-01", "2020-01-01", "2020-02-01", "2020-03-01", "2020-04-01", "2020-05-01", "2020-06-01", "2020-07-01", "2020-08-01", "2020-09-01", "2020-10-01", "2020-11-01", "2020-12-01", "2021-01-01", "2021-02-01", "2021-03-01", "2021-04-01", "2021-05-01", "2021-06-01", "2021-07-01", "2021-08-01", "2021-09-01", "2021-10-01", "2021-11-01", "2021-12-01", "2022-01-01", "2022-02-01", "2022-03-01", "2022-04-01", "2022-05-01", "2022-06-01", "2022-07-01", "2022-08-01", "2022-09-01", "2022-10-01", "2022-11-01", "2022-12-01", "2023-01-01", "2023-02-01", "2023-03-01", "2023-04-01", "2023-05-01", "2023-06-01", "2023-07-01", "2023-08-01", "2023-09-01", "2023-10-01", "2023-11-01", "2023-12-01", "2024-01-01", "2024-02-01", "2024-03-01", "2024-04-01", "2024-05-01", "2024-06-01", "2024-07-01", "2024-08-01", "2024-09-01", "2024-10-01", "2024-11-01", "2024-12-01", "2025-01-01", "2025-02-01", "2025-03-01", "2025-04-01", "2025-05-01", "2025-06-01", "2025-07-01", "2025-08-01", "2025-09-01", "2025-10-01", "2025-11-01", "2025-12-01", "2026-01-01", "2026-02-01", "2026-03-01", "2026-04-01", "2026-05-01", "2026-06-01", "2026-07-01", "2026-08-01"],
+  stratNav: [1.0, 1.0, 1.0, 1.0, 1.0, 0.9783, 0.9891, 0.9695, 0.9824, 1.0563, 1.1312, 1.0882, 1.053, 1.0818, 1.0454, 1.0398, 1.0486, 1.0599, 1.0277, 1.0896, 1.0946, 1.1018, 1.0527, 1.0801, 1.1192, 1.1693, 1.3049, 1.3509, 1.2572, 1.2721, 1.3107, 1.2714, 1.2134, 1.2551, 1.2253, 1.2303, 1.3068, 1.3053, 1.3221, 1.3694, 1.3501, 1.3504, 1.4626, 1.4762, 1.3364, 1.402, 1.311, 1.1204, 1.2247, 1.3183, 1.3503, 1.2837, 1.1801, 1.2286, 1.296, 1.2404, 1.357, 1.3763, 1.3401, 1.3046, 1.3034, 1.3297, 1.3163, 1.2652, 1.2607, 1.248, 1.2963, 1.2609, 1.0287, 1.1222, 1.1824, 1.1398, 1.1195, 1.0471, 1.0372, 1.0024, 1.2438, 1.2493, 1.3387, 1.2851, 1.272, 1.3666, 1.3645, 1.3197, 1.366, 1.4482, 1.511, 1.669, 1.6609, 1.6648, 1.6631, 1.7102, 1.8252, 1.8957, 1.7557, 1.8698, 1.8743, 1.9084, 1.6167],
+  bm300Nav: [2.8642, 2.667, 2.6187, 2.5329, 2.6122, 2.4133, 2.41, 2.2869, 2.4668, 2.8483, 3.0187, 2.9725, 2.7572, 2.9897, 2.8892, 2.8862, 2.8976, 3.0023, 2.9083, 3.1118, 3.0414, 2.9929, 2.7916, 2.9721, 3.0167, 3.2267, 3.5664, 3.6782, 3.4847, 3.5666, 3.849, 3.9586, 4.1153, 4.1162, 3.8822, 3.8919, 4.0576, 3.9725, 3.6546, 3.6989, 3.6966, 3.715, 3.6795, 3.7528, 3.4667, 3.5092, 3.2482, 3.0508, 3.1016, 3.393, 3.1818, 3.0717, 2.8903, 2.7606, 2.9585, 2.941, 3.1873, 3.1349, 3.0771, 3.0606, 2.8918, 2.9188, 3.0369, 2.8801, 2.8026, 2.7126, 2.6457, 2.6063, 2.4442, 2.6874, 2.7313, 2.738, 2.7194, 2.6421, 2.5973, 2.523, 3.052, 2.9549, 2.9751, 2.989, 2.8995, 2.9549, 2.9531, 2.8642, 2.9171, 2.995, 3.0802, 3.4363, 3.5251, 3.5251, 3.4764, 3.517, 3.575, 3.5783, 3.4381, 3.6517, 3.6798, 3.7669, 3.4853],
+  bm2000Nav: [0.9598, 0.8654, 0.8439, 0.7893, 0.7795, 0.7121, 0.7457, 0.7146, 0.7113, 0.8492, 0.9759, 0.8949, 0.8569, 0.879, 0.8319, 0.8229, 0.8361, 0.8413, 0.8058, 0.8716, 0.8865, 0.9009, 0.8572, 0.8747, 0.9203, 0.9583, 1.0879, 1.1323, 1.0405, 1.0493, 1.0643, 1.0057, 0.9197, 0.969, 0.9596, 0.9644, 1.0356, 1.0431, 1.097, 1.1474, 1.1252, 1.1235, 1.2582, 1.2661, 1.1341, 1.206, 1.1281, 0.9272, 1.0433, 1.121, 1.1812, 1.1154, 1.0142, 1.0847, 1.142, 1.0791, 1.1884, 1.2165, 1.1805, 1.1409, 1.1578, 1.1855, 1.1572, 1.1145, 1.1176, 1.1125, 1.1762, 1.1391, 0.8859, 0.9687, 1.0341, 0.9836, 0.962, 0.886, 0.8792, 0.8467, 1.071, 1.0878, 1.1899, 1.126, 1.1204, 1.2246, 1.2224, 1.1798, 1.228, 1.3155, 1.3794, 1.5252, 1.5061, 1.5106, 1.514, 1.5645, 1.6923, 1.7742, 1.6261, 1.736, 1.7383, 1.7686, 1.459],
+  buy300: {"d": ["2018-12-01", "2020-05-01"], "v": [0.9890521387927685, 1.0801469659025853]},
+  buy2000: {"d": ["2018-10-01", "2019-03-01", "2019-07-01", "2019-11-01", "2020-02-01", "2020-06-01", "2020-09-01", "2020-12-01", "2021-03-01"], "v": [0.99995, 1.0563189772730908, 1.0818234766364807, 1.0599031091601696, 1.0946101760279292, 1.119229260452912, 1.3509051105480705, 1.310669761127329, 1.2550710099181654]},
+  sell: {"d": ["2026-08-01", "2026-08-01"], "v": [1.6166568588225416, 1.6166568588225416]},
+  yearly: [{"year": 2018, "strategy": -0.0109, "csi300": -0.1586, "csi2000": -0.2231}, {"year": 2019, "strategy": 0.06, "csi300": 0.2893, "csi2000": 0.1268}, {"year": 2020, "strategy": 0.2029, "csi300": 0.2203, "csi2000": 0.1964}, {"year": 2021, "strategy": 0.1504, "csi300": -0.0805, "csi2000": 0.2299}, {"year": 2022, "strategy": -0.122, "csi300": -0.208, "csi2000": -0.1083}, {"year": 2023, "strategy": 0.0451, "csi300": -0.1042, "csi2000": 0.0622}, {"year": 2024, "strategy": 0.0617, "csi300": 0.1566, "csi2000": 0.0434}, {"year": 2025, "strategy": 0.2941, "csi300": 0.1979, "csi2000": 0.3568}, {"year": 2026, "strategy": -0.0547, "csi300": -0.0275, "csi2000": -0.0825}]
+};
+
+function gc() {
+  const s = getComputedStyle(document.documentElement);
+  return {
+    t2: s.getPropertyValue('--text2').trim(),
+    blue: s.getPropertyValue('--blue').trim(),
+    blueFill: s.getPropertyValue('--blueFill').trim(),
+    orange: s.getPropertyValue('--orange').trim(),
+    green: s.getPropertyValue('--green').trim(),
+    red: s.getPropertyValue('--red').trim(),
+    up: s.getPropertyValue('--up').trim(),
+    down: s.getPropertyValue('--down').trim(),
+    grid: s.getPropertyValue('--grid').trim(),
+  };
+}
+
+function baseLayout(c) {
+  return {
+    margin: {l:55, r:30, t:10, b:40},
+    paper_bgcolor:'transparent', plot_bgcolor:'transparent',
+    xaxis: {showgrid:true, gridcolor:c.grid, gridwidth:1, zeroline:false, tickfont:{size:12,color:c.t2}},
+    hovermode:'x unified', showlegend:true,
+    legend: {orientation:'h', y:1.12, font:{size:12,color:c.t2}},
+    dragmode: false
+  };
+}
+
+function plotNav(c) {
+  const tr = [
+    {x:D.stratDates, y:D.stratNav, type:'scatter', mode:'lines', name:'策略净值',
+      line:{color:c.blue, width:3},
+      hovertemplate:'策略: <b>%{y:.4f}</b><extra></extra>'},
+    {x:D.stratDates, y:D.bm300Nav, type:'scatter', mode:'lines', name:'沪深300 B&H',
+      line:{color:c.orange, width:1.8, dash:'dot'},
+      hovertemplate:'CSI300: <b>%{y:.4f}</b><extra></extra>'},
+    {x:D.stratDates, y:D.bm2000Nav, type:'scatter', mode:'lines', name:'中证2000 B&H',
+      line:{color:c.green, width:1.8, dash:'dot'},
+      hovertemplate:'CSI2000: <b>%{y:.4f}</b><extra></extra>'},
+  ];
+  if (D.buy300.d.length) tr.push({
+    x:D.buy300.d, y:D.buy300.v, type:'scatter', mode:'markers', name:'买入(CSI300)',
+    marker:{color:c.up, size:10, symbol:'triangle-up'},
+    hovertemplate:'🧊 买入 CSI300<extra></extra>'});
+  if (D.buy2000.d.length) tr.push({
+    x:D.buy2000.d, y:D.buy2000.v, type:'scatter', mode:'markers', name:'买入(CSI2000)',
+    marker:{color:c.up, size:10, symbol:'triangle-up', opacity:0.7},
+    hovertemplate:'🧊 买入 CSI2000<extra></extra>'});
+  if (D.sell.d.length) tr.push({
+    x:D.sell.d, y:D.sell.v, type:'scatter', mode:'markers', name:'泡沫卖出',
+    marker:{color:c.down, size:10, symbol:'triangle-down'},
+    hovertemplate:'⚠️ 泡沫卖出<extra></extra>'});
+
+  const ly = Object.assign({}, baseLayout(c), {
+    yaxis: {showgrid:true, gridcolor:c.grid, gridwidth:1, zeroline:true, zerolinecolor:c.grid, zerolinewidth:1.5,
+      tickformat:'.2f', tickfont:{size:12,color:c.t2},
+      title:{text:'净值 (初始=1.00)', font:{size:13,color:c.t2}}}
+  });
+  Plotly.newPlot('chartNav', tr, ly, {responsive:true, displayModeBar:false});
+}
+
+function plotYearly(c) {
+  const years = D.yearly.map(d => d.year);
+  const tr = [
+    {x:years, y:D.yearly.map(d=>d.strategy), type:'bar', name:'策略',
+      marker:{color:c.blue, opacity:0.85},
+      text:D.yearly.map(d=>(d.strategy>=0?'+':'')+(d.strategy*100).toFixed(1)+'%'),
+      textposition:'outside', textfont:{size:11,color:c.t2},
+      hovertemplate:'策略: <b>%{y:.2%}</b><extra></extra>'},
+    {x:years, y:D.yearly.map(d=>d.csi300), type:'bar', name:'沪深300',
+      marker:{color:c.orange, opacity:0.7},
+      hovertemplate:'CSI300: <b>%{y:.2%}</b><extra></extra>'},
+    {x:years, y:D.yearly.map(d=>d.csi2000), type:'bar', name:'中证2000',
+      marker:{color:c.green, opacity:0.7},
+      hovertemplate:'CSI2000: <b>%{y:.2%}</b><extra></extra>'},
+  ];
+  const ly = Object.assign({}, baseLayout(c), {
+    barmode:'group',
+    yaxis: {showgrid:true, gridcolor:c.grid, gridwidth:1, zeroline:true, zerolinecolor:c.grid, zerolinewidth:1.5,
+      tickformat:'.0%', tickfont:{size:12,color:c.t2},
+      title:{text:'年度收益率', font:{size:13,color:c.t2}}}
+  });
+  Plotly.newPlot('chartYearly', tr, ly, {responsive:true, displayModeBar:false});
+}
+
+const c = gc();
+plotNav(c); plotYearly(c);
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  Plotly.purge('chartNav'); Plotly.purge('chartYearly');
+  const nc = gc(); plotNav(nc); plotYearly(nc);
+});
+</script>
+</body>
+</html>

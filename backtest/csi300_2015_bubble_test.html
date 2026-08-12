@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSI300 2015泡沫专项测试</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+:root {
+  --bg:#ffffff; --text:#1a1a2e; --text2:#6b7280; --card:#f8f9fa; --border:#e5e7eb;
+  --up:#16a34a; --down:#dc2626; --blue:#2563eb; --orange:#ea580c; --green:#16a34a; --red:#dc2626;
+  --grid:rgba(128,128,128,0.15);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:#0f172a; --text:#e2e8f0; --text2:#94a3b8; --card:#1e293b; --border:#334155;
+    --up:#22c55e; --down:#ef4444; --blue:#60a5fa; --orange:#fb923c; --green:#4ade80; --red:#f87171;
+    --grid:rgba(148,163,184,0.12);
+  }
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;
+  background:var(--bg); color:var(--text); padding:40px 24px; max-width:1100px; margin:0 auto; }
+h1 { font-size:28px; font-weight:700; margin-bottom:6px; }
+.subtitle { color:var(--text2); font-size:14px; margin-bottom:32px; }
+.section { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:24px; margin-bottom:28px; }
+.section h2 { font-size:18px; font-weight:600; margin-bottom:16px; }
+.stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; margin-bottom:18px; }
+.stat-card { background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:12px 14px; }
+.stat-card .label { font-size:11px; color:var(--text2); margin-bottom:4px; }
+.stat-card .value { font-size:20px; font-weight:700; }
+.up { color:var(--up); } .down { color:var(--down); }
+.plot-box { width:100%; height:440px; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th,td { padding:8px 12px; text-align:right; border-bottom:1px solid var(--border); }
+th:first-child,td:first-child { text-align:left; }
+th { color:var(--text2); font-weight:500; font-size:11px; }
+tr:last-child td { border-bottom:none; }
+.buy { color:var(--up); font-weight:600; } .sell { color:var(--down); font-weight:600; }
+.footnote { color:var(--text2); font-size:12px; margin-top:24px; text-align:center; }
+</style>
+</head>
+<body>
+<h1>🧊 CSI300 专项: 2015 泡沫卖出验证</h1>
+<p class="subtitle">2013-01 ~ 2018-12 · 使用项目实际模型 (冰点评分 + 三分类泡沫检测) · 生成于 2026-08-12 23:42</p>
+
+<div class="section">
+  <h2>策略净值 vs 买入持有</h2>
+  <div class="stats-grid">
+    <div class="stat-card"><div class="label">策略累计收益</div><div class="value up">+63.79%</div></div>
+    <div class="stat-card"><div class="label">年化收益</div><div class="value up">+8.70%</div></div>
+    <div class="stat-card"><div class="label">最大回撤</div><div class="value down">-19.28%</div></div>
+    <div class="stat-card"><div class="label">B&H 收益</div><div class="value up">+25.68%</div></div>
+    <div class="stat-card"><div class="label">α</div><div class="value up">+38.11%</div></div>
+    <div class="stat-card"><div class="label">交易次数</div><div class="value">12笔</div></div>
+  </div>
+  <div id="chartNav" class="plot-box"></div>
+</div>
+
+<div class="section">
+  <h2>冰点评分走势（≥50触发买入）</h2>
+  <div id="chartScore" class="plot-box"></div>
+</div>
+
+<div class="section">
+  <h2>逐年收益</h2>
+  <div id="chartYearly" class="plot-box"></div>
+</div>
+
+<div class="section">
+  <h2>交易记录</h2>
+  <table>
+    <thead><tr><th>日期</th><th>操作</th><th>份额</th><th>指数点位</th><th>金额</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>2013-01-01</td>
+        <td class="buy">买入</td><td>9.91</td><td>2523</td>
+        <td>¥25,005</td><td style="font-size:11px;color:var(--text2)">评分=57</td></tr>
+      <tr><td>2013-04-01</td>
+        <td class="buy">买入</td><td>7.52</td><td>2493</td>
+        <td>¥18,752</td><td style="font-size:11px;color:var(--text2)">评分=65</td></tr>
+      <tr><td>2013-07-01</td>
+        <td class="buy">买入</td><td>6.35</td><td>2213</td>
+        <td>¥14,063</td><td style="font-size:11px;color:var(--text2)">评分=72</td></tr>
+      <tr><td>2013-10-01</td>
+        <td class="buy">买入</td><td>4.38</td><td>2409</td>
+        <td>¥10,547</td><td style="font-size:11px;color:var(--text2)">评分=73</td></tr>
+      <tr><td>2014-01-01</td>
+        <td class="buy">买入</td><td>3.39</td><td>2330</td>
+        <td>¥7,910</td><td style="font-size:11px;color:var(--text2)">评分=75</td></tr>
+      <tr><td>2014-04-01</td>
+        <td class="buy">买入</td><td>2.74</td><td>2163</td>
+        <td>¥5,932</td><td style="font-size:11px;color:var(--text2)">评分=67</td></tr>
+      <tr><td>2014-07-01</td>
+        <td class="buy">买入</td><td>2.05</td><td>2165</td>
+        <td>¥4,449</td><td style="font-size:11px;color:var(--text2)">评分=73</td></tr>
+      <tr><td>2015-05-01</td>
+        <td class="sell">卖出</td><td>9.09</td><td>4750</td>
+        <td>¥43,155</td><td style="font-size:11px;color:var(--text2)">轻度泡沫</td></tr>
+      <tr><td>2015-06-01</td>
+        <td class="sell">卖出</td><td>6.82</td><td>5076</td>
+        <td>¥34,590</td><td style="font-size:11px;color:var(--text2)">轻度泡沫</td></tr>
+      <tr><td>2015-07-01</td>
+        <td class="sell">卖出</td><td>5.11</td><td>4253</td>
+        <td>¥21,736</td><td style="font-size:11px;color:var(--text2)">轻度泡沫</td></tr>
+      <tr><td>2016-03-01</td>
+        <td class="buy">买入</td><td>9.62</td><td>2931</td>
+        <td>¥28,211</td><td style="font-size:11px;color:var(--text2)">评分=54</td></tr>
+      <tr><td>2018-12-01</td>
+        <td class="buy">买入</td><td>6.67</td><td>3173</td>
+        <td>¥21,157</td><td style="font-size:11px;color:var(--text2)">评分=66</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p class="footnote">模型: models/csi300.py (7维评分) + macro/sell_signal.py (三分类泡沫) · 不含分红滑点 · 历史不代表未来</p>
+
+<script>
+const D = {
+  stratDates: ["2013-01-01", "2013-02-01", "2013-03-01", "2013-04-01", "2013-05-01", "2013-06-01", "2013-07-01", "2013-08-01", "2013-09-01", "2013-10-01", "2013-11-01", "2013-12-01", "2014-01-01", "2014-02-01", "2014-03-01", "2014-04-01", "2014-05-01", "2014-06-01", "2014-07-01", "2014-08-01", "2014-09-01", "2014-10-01", "2014-11-01", "2014-12-01", "2015-01-01", "2015-02-01", "2015-03-01", "2015-04-01", "2015-05-01", "2015-06-01", "2015-07-01", "2015-08-01", "2015-09-01", "2015-10-01", "2015-11-01", "2015-12-01", "2016-01-01", "2016-02-01", "2016-03-01", "2016-04-01", "2016-05-01", "2016-06-01", "2016-07-01", "2016-08-01", "2016-09-01", "2016-10-01", "2016-11-01", "2016-12-01", "2017-01-01", "2017-02-01", "2017-03-01", "2017-04-01", "2017-05-01", "2017-06-01", "2017-07-01", "2017-08-01", "2017-09-01", "2017-10-01", "2017-11-01", "2017-12-01", "2018-01-01", "2018-02-01", "2018-03-01", "2018-04-01", "2018-05-01", "2018-06-01", "2018-07-01", "2018-08-01", "2018-09-01", "2018-10-01", "2018-11-01", "2018-12-01"],
+  stratNav: [1.0, 1.0218, 1.0144, 0.997, 0.989, 1.0167, 0.9482, 0.9558, 0.9721, 0.9947, 0.9879, 1.0031, 0.9724, 0.9322, 0.9248, 0.9197, 0.9182, 0.9175, 0.9202, 0.9801, 0.9896, 1.0243, 1.0452, 1.1584, 1.4179, 1.3818, 1.4321, 1.6324, 1.8599, 1.9488, 1.7804, 1.7135, 1.6438, 1.6194, 1.6702, 1.679, 1.7004, 1.5731, 1.5776, 1.6503, 1.634, 1.635, 1.6334, 1.639, 1.6702, 1.6581, 1.6845, 1.7359, 1.6723, 1.6917, 1.7093, 1.7087, 1.7046, 1.7191, 1.7613, 1.7872, 1.8022, 1.8037, 1.8436, 1.844, 1.8522, 1.9059, 1.8567, 1.8191, 1.7838, 1.7872, 1.7224, 1.7066, 1.6784, 1.7044, 1.6391, 1.6379],
+  bmNav: [0.9994, 1.0867, 1.0572, 0.9876, 0.9695, 1.0325, 0.8768, 0.8895, 0.9166, 0.9543, 0.9448, 0.9661, 0.923, 0.8725, 0.8632, 0.8569, 0.8551, 0.8542, 0.8575, 0.9228, 0.933, 0.9709, 0.9936, 1.117, 1.3998, 1.3605, 1.4153, 1.6336, 1.8816, 2.0108, 1.6848, 1.5119, 1.3318, 1.2688, 1.4, 1.4228, 1.478, 1.1492, 1.1609, 1.2763, 1.2505, 1.252, 1.2495, 1.2584, 1.3079, 1.2887, 1.3306, 1.4122, 1.3112, 1.3421, 1.37, 1.3691, 1.3626, 1.3856, 1.4525, 1.4936, 1.5174, 1.5198, 1.5832, 1.5838, 1.5968, 1.6819, 1.604, 1.5443, 1.4882, 1.4937, 1.3908, 1.3656, 1.3209, 1.3622, 1.2585, 1.2568],
+  priceDates: ["2013-01-01", "2013-02-01", "2013-03-01", "2013-04-01", "2013-05-01", "2013-06-01", "2013-07-01", "2013-08-01", "2013-09-01", "2013-10-01", "2013-11-01", "2013-12-01", "2014-01-01", "2014-02-01", "2014-03-01", "2014-04-01", "2014-05-01", "2014-06-01", "2014-07-01", "2014-08-01", "2014-09-01", "2014-10-01", "2014-11-01", "2014-12-01", "2015-01-01", "2015-02-01", "2015-03-01", "2015-04-01", "2015-05-01", "2015-06-01", "2015-07-01", "2015-08-01", "2015-09-01", "2015-10-01", "2015-11-01", "2015-12-01", "2016-01-01", "2016-02-01", "2016-03-01", "2016-04-01", "2016-05-01", "2016-06-01", "2016-07-01", "2016-08-01", "2016-09-01", "2016-10-01", "2016-11-01", "2016-12-01", "2017-01-01", "2017-02-01", "2017-03-01", "2017-04-01", "2017-05-01", "2017-06-01", "2017-07-01", "2017-08-01", "2017-09-01", "2017-10-01", "2017-11-01", "2017-12-01", "2018-01-01", "2018-02-01", "2018-03-01", "2018-04-01", "2018-05-01", "2018-06-01", "2018-07-01", "2018-08-01", "2018-09-01", "2018-10-01", "2018-11-01", "2018-12-01"],
+  prices: [2522.95, 2743.32, 2668.84, 2493.19, 2447.31, 2606.43, 2213.32, 2245.36, 2313.91, 2409.04, 2384.96, 2438.94, 2330.03, 2202.45, 2178.97, 2163.11, 2158.66, 2156.46, 2164.56, 2329.4, 2355.32, 2450.99, 2508.32, 2819.81, 3533.7, 3434.39, 3572.84, 4123.9, 4749.89, 5076.18, 4253.02, 3816.7, 3362.08, 3202.95, 3534.08, 3591.7, 3731.01, 2901.05, 2930.69, 3221.89, 3156.74, 3160.55, 3154.2, 3176.81, 3301.58, 3253.28, 3359.05, 3565.04, 3310.08, 3387.96, 3458.44, 3456.05, 3439.75, 3497.74, 3666.8, 3770.38, 3830.54, 3836.5, 3996.62, 3998.14, 4030.86, 4245.9, 4049.09, 3898.5, 3756.88, 3770.59, 3510.99, 3447.39, 3334.5, 3438.86, 3177.03, 3172.69],
+  scores: [57.0, 42.0, 49.0, 65.0, 78.0, 63.0, 72.0, 75.0, 77.0, 73.0, 70.0, 62.0, 75.0, 82.0, 72.0, 67.0, 75.0, 83.0, 73.0, 51.0, 57.0, 49.0, 46.0, 18.0, 2.0, 7.0, 13.0, 10.0, 2.0, 5.0, 17.0, 25.0, 30.0, 48.0, 37.0, 30.0, 35.0, 48.0, 54.0, 35.0, 52.0, 42.0, 28.0, 26.0, 15.0, 25.0, 18.0, 13.0, 17.0, 22.0, 8.0, 2.0, 2.0, 2.0, 2.0, 2.0, 5.0, 17.0, 11.0, 5.0, 15.0, 8.0, 7.0, 23.0, 23.0, 22.0, 32.0, 30.0, 48.0, 30.0, 49.0, 66.0],
+  buy: {"d": ["2013-01-01", "2013-04-01", "2013-07-01", "2013-10-01", "2014-01-01", "2014-04-01", "2014-07-01", "2016-03-01", "2018-12-01"], "v": [0.99995, 0.9969630805530107, 0.9481563590997338, 0.9946809294881777, 0.9724164610953737, 0.9197393323879741, 0.9202256512851664, 1.5775902410976483, 1.6379480466114218]},
+  sell: {"d": ["2015-05-01", "2015-06-01", "2015-07-01"], "v": [1.8598899795438728, 1.948774928237666, 1.7804241745164722]},
+  yearly: [{"year": 2013, "strategy": 0.0032, "csi300": -0.0339}, {"year": 2014, "strategy": 0.1913, "csi300": 0.2144}, {"year": 2015, "strategy": 0.1842, "csi300": -0.0137}, {"year": 2016, "strategy": 0.0209, "csi300": 0.0277}, {"year": 2017, "strategy": 0.1027, "csi300": 0.1962}, {"year": 2018, "strategy": -0.1157, "csi300": -0.2238}]
+};
+
+function gc() {
+  const s = getComputedStyle(document.documentElement);
+  return {
+    t2: s.getPropertyValue('--text2').trim(),
+    blue: s.getPropertyValue('--blue').trim(),
+    orange: s.getPropertyValue('--orange').trim(),
+    green: s.getPropertyValue('--green').trim(),
+    up: s.getPropertyValue('--up').trim(),
+    down: s.getPropertyValue('--down').trim(),
+    grid: s.getPropertyValue('--grid').trim(),
+  };
+}
+
+function baseLayout(c) {
+  return {
+    margin:{l:55,r:30,t:10,b:40}, paper_bgcolor:'transparent', plot_bgcolor:'transparent',
+    xaxis:{showgrid:true,gridcolor:c.grid,gridwidth:1,zeroline:false,tickfont:{size:12,color:c.t2}},
+    hovermode:'x unified', showlegend:true,
+    legend:{orientation:'h',y:1.12,font:{size:12,color:c.t2}}, dragmode:false
+  };
+}
+
+function plotNav(c) {
+  const tr = [
+    {x:D.stratDates,y:D.stratNav,type:'scatter',mode:'lines',name:'策略净值',
+      line:{color:c.blue,width:3},hovertemplate:'策略: <b>%{y:.4f}</b><extra></extra>'},
+    {x:D.stratDates,y:D.bmNav,type:'scatter',mode:'lines',name:'CSI300 买入持有',
+      line:{color:c.orange,width:1.8,dash:'dot'},hovertemplate:'B&H: <b>%{y:.4f}</b><extra></extra>'},
+  ];
+  if (D.buy.d.length) tr.push({x:D.buy.d,y:D.buy.v,type:'scatter',mode:'markers',name:'冰点买入',
+    marker:{color:c.up,size:11,symbol:'triangle-up'},hovertemplate:'🧊 冰点买入<extra></extra>'});
+  if (D.sell.d.length) tr.push({x:D.sell.d,y:D.sell.v,type:'scatter',mode:'markers',name:'泡沫卖出',
+    marker:{color:c.down,size:11,symbol:'triangle-down'},hovertemplate:'⚠️ 泡沫卖出<extra></extra>'});
+  const ly = Object.assign({}, baseLayout(c), {
+    yaxis:{showgrid:true,gridcolor:c.grid,gridwidth:1,zeroline:true,zerolinecolor:c.grid,zerolinewidth:1.5,
+      tickformat:'.2f',tickfont:{size:12,color:c.t2},title:{text:'净值',font:{size:13,color:c.t2}}}
+  });
+  Plotly.newPlot('chartNav', tr, ly, {responsive:true,displayModeBar:false});
+}
+
+function plotScore(c) {
+  const tr = [
+    {x:D.priceDates,y:D.prices,type:'scatter',mode:'lines',name:'指数点位',yaxis:'y2',
+      line:{color:c.orange,width:1.5},hovertemplate:'点位: <b>%{y:.0f}</b><extra></extra>'},
+    {x:D.priceDates,y:D.scores,type:'scatter',mode:'lines',name:'冰点评分',
+      line:{color:c.blue,width:2.5},hovertemplate:'评分: <b>%{y:.1f}</b><extra></extra>'},
+  ];
+  const ly = Object.assign({}, baseLayout(c), {
+    yaxis:{showgrid:true,gridcolor:c.grid,gridwidth:1,zeroline:true,zerolinecolor:c.grid,zerolinewidth:1.5,
+      range:[0,100],tickfont:{size:12,color:c.t2},title:{text:'评分(0-100)',font:{size:13,color:c.t2}}},
+    yaxis2:{overlaying:'y',side:'right',showgrid:false,tickfont:{size:12,color:c.t2},
+      title:{text:'指数点位',font:{size:13,color:c.t2}}},
+    shapes:[{type:'line',x0:D.priceDates[0],x1:D.priceDates[D.priceDates.length-1],y0:50,y1:50,
+      line:{color:c.green,dash:'dash',width:1.5}}]
+  });
+  Plotly.newPlot('chartScore', tr, ly, {responsive:true,displayModeBar:false});
+}
+
+function plotYearly(c) {
+  const years = D.yearly.map(d=>d.year);
+  const tr = [
+    {x:years,y:D.yearly.map(d=>d.strategy),type:'bar',name:'策略',
+      marker:{color:c.blue,opacity:0.85},
+      text:D.yearly.map(d=>(d.strategy>=0?'+':'')+(d.strategy*100).toFixed(1)+'%'),
+      textposition:'outside',textfont:{size:11,color:c.t2},
+      hovertemplate:'策略: <b>%{y:.2%}</b><extra></extra>'},
+    {x:years,y:D.yearly.map(d=>d.csi300),type:'bar',name:'CSI300 B&H',
+      marker:{color:c.orange,opacity:0.7},
+      hovertemplate:'B&H: <b>%{y:.2%}</b><extra></extra>'},
+  ];
+  const ly = Object.assign({}, baseLayout(c), {
+    barmode:'group',
+    yaxis:{showgrid:true,gridcolor:c.grid,gridwidth:1,zeroline:true,zerolinecolor:c.grid,zerolinewidth:1.5,
+      tickformat:'.0%',tickfont:{size:12,color:c.t2},title:{text:'年度收益率',font:{size:13,color:c.t2}}}
+  });
+  Plotly.newPlot('chartYearly', tr, ly, {responsive:true,displayModeBar:false});
+}
+
+const c = gc();
+plotNav(c); plotScore(c); plotYearly(c);
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  Plotly.purge('chartNav'); Plotly.purge('chartScore'); Plotly.purge('chartYearly');
+  const nc = gc(); plotNav(nc); plotScore(nc); plotYearly(nc);
+});
+</script>
+</body>
+</html>
