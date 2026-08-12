@@ -136,7 +136,11 @@ def generate_signal(data: dict, macro_df: pd.DataFrame,
     buying = [e for e, ice in [('沪深300', ice['csi300']), ('中证2000', ice['csi2000'])] if ice]
     if bubble['is_bubble']:
         sell_pct = bubble.get('sell_pct', 0.5)
-        advice = f"⚠️ {bubble['level']}: {'; '.join(bubble['reasons'][:3])} → 卖出{sell_pct:.0%}"
+        if bubble.get('signal_type') == 'trend_breakdown':
+            # 趋势破坏是独立风控信号，非泡沫极端信号
+            advice = f"📉 {bubble['level']}: {'; '.join(bubble['reasons'][:2])} → 风控减仓{sell_pct:.0%}（非泡沫信号）"
+        else:
+            advice = f"⚠️ {bubble['level']}: {'; '.join(bubble['reasons'][:3])} → 卖出{sell_pct:.0%}"
     elif buying:
         advice = f"🧊 冰点: {'+'.join(buying)} → 分批买入"
     else:
@@ -150,6 +154,7 @@ def generate_signal(data: dict, macro_df: pd.DataFrame,
         'score_2000': ice['score_2000'],
         'pe_pct_300': ice['pe_pct_300'],
         'bubble': bubble['is_bubble'],
+        'bubble_signal_type': bubble.get('signal_type'),
         'bubble_level': bubble.get('level', ''),
         'bubble_sell_pct': bubble.get('sell_pct', 0.5),
         'bubble_reasons': bubble.get('reasons', []),

@@ -239,6 +239,62 @@ def fetch_china_macro(force=False):
 
 
 # ═══════════════════════════════════════════════════════════════
+# 两融余额 + 新开户数（泡沫 D类信号：流动性/杠杆狂热）
+# ═══════════════════════════════════════════════════════════════
+
+def fetch_margin_balance(force=False):
+    """两融融资余额（亿元），2012至今日频。"""
+    cache = "margin_balance.parquet"
+    if not force:
+        c = _load(cache)
+        if c is not None:
+            return c
+
+    import akshare as ak
+    raw = ak.stock_margin_account_info()
+    df = pd.DataFrame({
+        "date": pd.to_datetime(raw["日期"]),
+        "margin_balance": pd.to_numeric(raw["融资余额"], errors="coerce"),
+    }).dropna(subset=["margin_balance"])
+    df = df.sort_values("date").reset_index(drop=True)
+    logger.info("两融余额: %d行 %s~%s 最新=%.0f亿",
+                len(df), df["date"].min().date(), df["date"].max().date(),
+                df["margin_balance"].iloc[-1])
+    _save(df, cache)
+    return df
+
+
+def fetch_new_accounts(force=False):
+    """
+    [已弃用 2026-08-12] 新增投资者数量（万户），2015-04至今月频。
+
+    弃用原因：akshare 经东方财富转手的数据管道只更新到 2023-08 后冻结，
+    实盘信号不可信。回测验证表明移除该信号后：
+    - 2015 泡沫卖出完全不受影响（两融+价格加速已够 ≥2类）
+    - 仅丢失 2021-03 逃顶卖出（累计影响约 +1%）
+    保留函数供历史研究，不再接入 fetch_all_macro。
+    """
+    cache = "new_accounts.parquet"
+    if not force:
+        c = _load(cache)
+        if c is not None:
+            return c
+
+    import akshare as ak
+    raw = ak.stock_account_statistics_em()
+    df = pd.DataFrame({
+        "date": pd.to_datetime(raw["数据日期"]),
+        "new_accounts": pd.to_numeric(raw["新增投资者-数量"], errors="coerce"),
+    }).dropna(subset=["new_accounts"])
+    df = df.sort_values("date").reset_index(drop=True)
+    logger.info("新开户数: %d行 %s~%s 最新=%.0f万户",
+                len(df), df["date"].min().date(), df["date"].max().date(),
+                df["new_accounts"].iloc[-1])
+    _save(df, cache)
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════
 # 美联储利率（辅助）
 # ═══════════════════════════════════════════════════════════════
 
@@ -283,6 +339,8 @@ def _safe_fetch(fetcher, name, force, **kwargs):
             return _load_any("china_macro_monthly.parquet")
         elif "fed" in name.lower():
             return _load_any("fed_rate.parquet")
+        elif "margin" in name.lower() or "两融" in name:
+            return _load_any("margin_balance.parquet")
         raise
 
 
@@ -304,6 +362,7 @@ def fetch_all_macro(force=False):
     gold = _safe_fetch(fetch_gold, "黄金", force)
     china = _safe_fetch(fetch_china_macro, "中国宏观", force)
     fed = _safe_fetch(fetch_fed_rate, "美联储", force)
+    margin = _safe_fetch(fetch_margin_balance, "两融余额", force)
 
     # 基准日期序列（统一 ns 精度）
     df = fx[["date"]].copy().sort_values("date")
@@ -339,6 +398,8 @@ def fetch_all_macro(force=False):
 
     df = _add_cols(df, fed[["date", "fed_rate"]].dropna(subset=["fed_rate"]).sort_values("date"),
                    ["fed_rate"])
+    df = _add_cols(df, margin[["date", "margin_balance"]].dropna(subset=["margin_balance"]).sort_values("date"),
+                   ["margin_balance"])
 
     # 衍生因子（仅当原始列存在时计算）
     if "cn_10y" in df.columns and "cn_2y" in df.columns:

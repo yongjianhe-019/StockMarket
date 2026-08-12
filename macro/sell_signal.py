@@ -1,16 +1,25 @@
 """
-卖出信号 v3 — 多维度泡沫检测器
+卖出信号 v4 — 多维度泡沫检测器
 
-泡沫的定义：估值贵 + (价格加速/量价背离/宏观恶化) ≥2 类 → 泡沫确认
+泡沫的定义：估值贵 + (价格加速/量价背离/宏观恶化/流动性狂热) ≥2 类 → 泡沫确认
+v4 新增（2026-08-12 优化）：
+- D类「流动性/杠杆狂热」：两融余额激增、新开户激增、成交量极端放大
+  补上 v3 对 2015 式杠杆牛市的盲区（v3 的 B量价背离/C宏观恶化
+  在快泡沫中永不触发，导致 2015 股灾满仓扛过）
+- 趋势兜底：PE>60%分位 且 跌破MA60且MA60拐头 → 直接泡沫确认
+  即使 A/B/C/D 检测器全部漏判，趋势破坏也强制卖出
+
 借鉴：
 - 广发证券：PE见顶先于价格见顶，真正的顶部=盈利增速拐点+情绪极端
 - "买在无人问津，卖在人声鼎沸"：市场反应度>70%注意减仓
 - 量价经典：价格加速赶顶+成交量背离=聪明钱离场
+- 2015年复盘：杠杆牛=两融余额半年翻倍+天量新开户，缩量背离不出现
 
 三级泡沫 → 分批卖出：
 - 轻度泡沫 (3~4信号): 卖出25%
 - 中度泡沫 (5~6信号): 卖出50%
 - 严重泡沫 (7+信号):  卖出75%
+- 趋势兜底:           卖出50%（强制）
 """
 
 from __future__ import annotations
@@ -50,7 +59,8 @@ def is_bubble(macro_df: pd.DataFrame, csi300_val=None, csi2000_val=None,
     pe_pct = _pe_percentile(csi300_val, row['date'])
     if pe_pct is None or pe_pct < 0.60:
         return {
-            "is_bubble": False, "level": "PE合理", "sell_pct": 0.0,
+            "is_bubble": False, "signal_type": None,
+            "level": "PE合理", "sell_pct": 0.0,
             "reasons": [], "signals": {}, "pe_pct": pe_pct,
         }
 
@@ -69,6 +79,13 @@ def is_bubble(macro_df: pd.DataFrame, csi300_val=None, csi2000_val=None,
     # ═══════════════════════════════════════
     signals_c = _check_macro_deterioration(hist)
 
+    # D类: 流动性/杠杆狂热（v4 新增 — 补 2015 式杠杆牛盲区）
+    signals_d = _check_liquidity_frenzy(hist, daily_300, row['date']) if daily_300 is not None else \
+        _check_liquidity_frenzy(hist, None, row['date'])
+
+    # 趋势兜底（v4 新增）：PE贵 + 跌破MA60且MA60拐头 → 强制泡沫
+    trend_breakdown = _check_trend_breakdown(daily_300, row['date']) if daily_300 is not None else False
+
     # ═══════════════════════════════════════
     # 汇总判断：≥2 类触发 → 泡沫
     # ═══════════════════════════════════════
@@ -76,9 +93,38 @@ def is_bubble(macro_df: pd.DataFrame, csi300_val=None, csi2000_val=None,
     if signals_a: categories_triggered += 1
     if signals_b: categories_triggered += 1
     if signals_c: categories_triggered += 1
+    if signals_d: categories_triggered += 1
 
-    all_signals = signals_a + signals_b + signals_c
+    all_signals = signals_a + signals_b + signals_c + signals_d
     total_count = len(all_signals)
+
+    signal_pack = {
+        "A_价格加速": signals_a,
+        "B_量价背离": signals_b,
+        "C_宏观恶化": signals_c,
+        "D_流动性狂热": signals_d,
+    }
+
+    if trend_breakdown:
+        # 趋势破坏（独立信号，非泡沫）：估值仍贵 + 趋势结构破坏 → 减仓
+        # 与真泡沫信号分开命名：泡沫=极端情绪信号，趋势破坏=风控信号
+        if total_count >= 7:
+            level, sell_pct = "趋势破坏·减仓75%", 0.75
+        else:
+            level, sell_pct = "趋势破坏·减仓50%", 0.50
+        return {
+            "is_bubble": True,
+            "signal_type": "trend_breakdown",
+            "level": level,
+            "sell_pct": sell_pct,
+            "reasons": all_signals + ["跌破MA60且MA60拐头(趋势破坏)"],
+            "signals": dict(signal_pack, **{
+                "趋势破坏": ["跌破MA60且MA60拐头"],
+                "触发类别数": categories_triggered,
+                "总信号数": total_count,
+            }),
+            "pe_pct": pe_pct,
+        }
 
     if categories_triggered >= 2:
         if total_count >= 7:
@@ -90,29 +136,24 @@ def is_bubble(macro_df: pd.DataFrame, csi300_val=None, csi2000_val=None,
 
         return {
             "is_bubble": True,
+            "signal_type": "bubble",
             "level": level,
             "sell_pct": sell_pct,
             "reasons": all_signals,
-            "signals": {
-                "A_价格加速": signals_a,
-                "B_量价背离": signals_b,
-                "C_宏观恶化": signals_c,
+            "signals": dict(signal_pack, **{
                 "触发类别数": categories_triggered,
                 "总信号数": total_count,
-            },
+            }),
             "pe_pct": pe_pct,
         }
     else:
         return {
             "is_bubble": False,
-            "level": f"PE偏高但仅{categories_triggered}/3类触发",
+            "signal_type": None,
+            "level": f"PE偏高但仅{categories_triggered}/4类触发",
             "sell_pct": 0.0,
             "reasons": all_signals,
-            "signals": {
-                "A_价格加速": signals_a,
-                "B_量价背离": signals_b,
-                "C_宏观恶化": signals_c,
-            },
+            "signals": signal_pack,
             "pe_pct": pe_pct,
         }
 
@@ -266,6 +307,83 @@ def _check_macro_deterioration(hist: pd.DataFrame) -> list:
 # ═══════════════════════════════════════════
 # 工具函数
 # ═══════════════════════════════════════════
+
+# ---------------------------------------------------------------------------
+# D类: 流动性/杠杆狂热（v4 新增）
+# ---------------------------------------------------------------------------
+
+def _check_liquidity_frenzy(hist: pd.DataFrame, daily: pd.DataFrame, date) -> list:
+    """
+    检测流动性/杠杆狂热——2015式杠杆牛市的核心特征。
+
+    1) 两融余额6个月增速 > 50%（2015上半年: 两融半年翻倍）
+    2) 新开户数 > 300万户（2015年4-6月: 415~497万户，正常月份~100万）
+    3) 成交量20日均值 / 250日均值 > 2.5倍（极端放量）
+    """
+    signals = []
+
+    # 1) 两融余额激增
+    if hist is not None and 'margin_balance' in hist.columns:
+        mb = hist['margin_balance'].dropna()
+        if len(mb) >= 126:
+            chg_6m = float(mb.iloc[-1]) / float(mb.iloc[-126]) - 1
+            if chg_6m > 0.50:
+                signals.append(f"两融6月增{chg_6m:.0%} (杠杆狂热)")
+        elif len(mb) >= 63:
+            chg_3m = float(mb.iloc[-1]) / float(mb.iloc[-63]) - 1
+            if chg_3m > 0.30:
+                signals.append(f"两融3月增{chg_3m:.0%} (杠杆升温)")
+
+    # 2) 新开户激增（已禁用 2026-08-12: 东财管道数据截至2023-08冻结，实盘不可信）
+    # if hist is not None and 'new_accounts' in hist.columns:
+    #     na = hist['new_accounts'].dropna()
+    #     if len(na) >= 1:
+    #         latest = float(na.iloc[-1])
+    #         if latest > 300:
+    #             signals.append(f"新开户{latest:.0f}万户 (散户入场)")
+    #         elif len(na) >= 2 and latest > 200 and float(na.iloc[-2]) > 150:
+    #             signals.append(f"新开户{latest:.0f}万户 (开户升温)")
+
+    # 3) 成交量极端放大
+    if daily is not None and not daily.empty and 'volume' in daily.columns:
+        d = daily[daily['date'] <= date]
+        if len(d) >= 250:
+            vol = d['volume']
+            vol_ma20 = float(vol.tail(20).mean())
+            vol_ma250 = float(vol.tail(250).mean())
+            if vol_ma250 > 0 and vol_ma20 / vol_ma250 > 2.5:
+                signals.append(f"成交量20日/年均{vol_ma20/vol_ma250:.1f}倍 (天量换手)")
+
+    return signals
+
+
+# ---------------------------------------------------------------------------
+# 趋势兜底（v4 新增）
+# ---------------------------------------------------------------------------
+
+def _check_trend_breakdown(daily: pd.DataFrame, date) -> bool:
+    """
+    趋势破坏检测：收盘价跌破 MA60 且 MA60 本身拐头向下。
+
+    这是泡沫检测的保险丝：当 A/B/C/D 全部漏判时（如情绪驱动快泡沫），
+    趋势破坏仍然能强制触发卖出。仅在 PE>60% 分位时由主函数调用。
+    """
+    if daily is None or daily.empty:
+        return False
+
+    d = daily[daily['date'] <= date]
+    if len(d) < 80:
+        return False
+
+    close = d['close']
+    current = float(close.iloc[-1])
+    ma60_now = float(close.tail(60).mean())
+    # 20个交易日前（约1个月前）的 MA60 近似
+    ma60_prev = float(close.iloc[-80:-20].mean())
+
+    # 跌破 MA60 且 MA60 拐头向下
+    return current < ma60_now and ma60_now < ma60_prev
+
 
 def _pe_percentile(val_df, date):
     """计算当前 PE 在历史上的分位数。"""
