@@ -1,8 +1,11 @@
 """
 A股数据获取 — 标的: CSI 300(159330) / CSI 2000(159531)
 
-稳定源优先: Sina + BaoStock + csindex 保证核心数据永不断
-东财作为可选补充，网络不稳定时自动降级，不影响主流程
+多渠道冗余: 每个数据至少两个独立源，主源失败自动降级
+- 指数日线: Sina 主源 + BaoStock 校验
+- ETF 日线: Sina 主源 → 东财备源 → 缓存兜底 + BaoStock 校验
+- 估值: 乐股(PE/PB) / csindex(PE)
+东财网络不稳定（本机代理劫持），仅作备源，不影响主流程
 """
 
 from __future__ import annotations
@@ -193,35 +196,74 @@ def _bs_etf(code):
     return _v(df.rename(columns={"turn":"turnover"}), f"BS-{code}")
 
 
+def _sina_etf(code):
+    """新浪 ETF 日K线（稳定主源，东财不可用时的保障）。"""
+    url = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           "CN_MarketData.getKLineData")
+    r = requests.get(url, params={
+        "symbol": f"sz{code}", "scale": 240, "ma": "no", "datalen": 1023,
+    }, timeout=20); r.raise_for_status()
+    data = json.loads(r.text)
+    if not data:
+        raise ValueError("空")
+    rows = []
+    for d in data:
+        rows.append({"date": pd.Timestamp(d["day"]), "open": float(d["open"]),
+                     "close": float(d["close"]), "high": float(d["high"]),
+                     "low": float(d["low"]), "volume": float(d["volume"])})
+    return _v(pd.DataFrame(rows), f"ETF{code}-Sina")
+
+
 def fetch_etf_daily(code, name, force=False):
     cache = f"etf_{code}_daily.parquet"
     if not force:
         c = _load(cache)
         if c is not None: return c
 
-    secid_map = {"159330": "0.159330", "159531": "0.159531"}
-    url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
-           f"?secid={secid_map[code]}&klt=101&fqt=1&beg=20230101"
-           f"&end={datetime.now().strftime('%Y%m%d')}"
-           "&fields1=f1,f2,f3,f4,f5,f6"
-           "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61")
-    r = requests.get(url, timeout=30); r.raise_for_status()
-    klines = json.loads(r.text).get("data", {}).get("klines")
-    if not klines: raise RuntimeError(f"ETF{code} 东财空")
+    df = None
+    last_err = None
 
-    rows = []
-    for line in klines:
-        p = line.split(",")
-        if len(p) < 7: continue
-        row = {"date": pd.Timestamp(p[0]), "open": float(p[1]), "close": float(p[2]),
-               "high": float(p[3]), "low": float(p[4]),
-               "volume": float(p[5]), "amount": float(p[6])}
-        if len(p) >= 11:
-            try: row["turnover"] = float(p[10])
-            except: pass
-        rows.append(row)
-    df = _v(pd.DataFrame(rows), f"ETF{code}")
+    # 1) 新浪主源（稳定）
+    try:
+        df = _sina_etf(code)
+    except Exception as e:
+        last_err = e
+        logger.warning("ETF%s 新浪: %s", name, str(e)[:80])
 
+    # 2) 东财补充（可选，失败不阻塞）
+    if df is None:
+        try:
+            secid_map = {"159330": "0.159330", "159531": "0.159531"}
+            url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
+                   f"?secid={secid_map[code]}&klt=101&fqt=1&beg=20230101"
+                   f"&end={datetime.now().strftime('%Y%m%d')}"
+                   "&fields1=f1,f2,f3,f4,f5,f6"
+                   "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61")
+            r = requests.get(url, timeout=30); r.raise_for_status()
+            klines = json.loads(r.text).get("data", {}).get("klines")
+            if not klines: raise RuntimeError(f"ETF{code} 东财空")
+            rows = []
+            for line in klines:
+                p = line.split(",")
+                if len(p) < 7: continue
+                rows.append({"date": pd.Timestamp(p[0]), "open": float(p[1]),
+                             "close": float(p[2]), "high": float(p[3]),
+                             "low": float(p[4]), "volume": float(p[5]),
+                             "amount": float(p[6])})
+            df = _v(pd.DataFrame(rows), f"ETF{code}")
+        except Exception as e:
+            last_err = e
+            logger.warning("ETF%s 东财: %s", name, str(e)[:80])
+
+    # 3) 双源都失败 → 回退缓存
+    if df is None:
+        cached = _load(cache) if not force else None
+        if cached is not None:
+            logger.warning("ETF%s: 全部数据源失败(%s)，使用缓存", name, str(last_err)[:60])
+            return cached
+        raise RuntimeError(f"ETF{code}: 所有数据源均失败: {last_err}")
+
+    # 4) BaoStock 校验（可选）
     try: df = _xv(df, _bs_etf(code), f"ETF{name}")
     except Exception as e: logger.warning("ETF%s BaoStock: %s", name, e)
 
@@ -355,16 +397,47 @@ def _find_col(df, candidates):
 
 
 def fetch_bond_yield_10y():
+    """
+    10年国债收益率，多渠道降级:
+    1. bond_zh_us_rate (datacenter-web, 1990至今) — 当前可用
+    2. bond_china_yield (中债, 2020-2021 已停更) — 仅作回退
+    """
     import akshare as ak
-    df = ak.bond_china_yield()
-    col = next((c for c in df.columns if "10" in str(c)), None)
-    if col is None: raise ValueError("无10年列")
-    df = df.rename(columns={"日期":"date", col:"yield_10y"})
-    df["date"] = pd.to_datetime(df["date"])
-    df["yield_10y"] = pd.to_numeric(df["yield_10y"], errors="coerce")
-    df = df[["date","yield_10y"]].dropna()
-    logger.info("国债: %d行 %.2f%%", len(df), df["yield_10y"].iloc[-1])
-    return _v(df, "国债")
+    last_err = None
+
+    # 1) 主源: 中美利差接口的 cn_10y（东财 datacenter，验证可用至昨日）
+    try:
+        raw = ak.bond_zh_us_rate()
+        df = pd.DataFrame({
+            "date": pd.to_datetime(raw["日期"]),
+            "yield_10y": pd.to_numeric(raw["中国国债收益率10年"], errors="coerce"),
+        }).dropna(subset=["yield_10y"])
+        df = df.sort_values("date").reset_index(drop=True)
+        # 校验新鲜度: 数据必须更新到近7天内，否则视为源失效
+        if (datetime.now() - df["date"].iloc[-1]).days <= 7:
+            logger.info("国债: %d行 %s~%s 最新=%.2f%%",
+                        len(df), df["date"].min().strftime("%Y-%m-%d"),
+                        df["date"].max().strftime("%Y-%m-%d"), df["yield_10y"].iloc[-1])
+            return _v(df, "国债")
+        last_err = f"数据停更于{df['date'].iloc[-1].date()}"
+    except Exception as e:
+        last_err = str(e)[:80]
+
+    # 2) 回退: 中债信息网
+    try:
+        df = ak.bond_china_yield()
+        col = next((c for c in df.columns if "10" in str(c)), None)
+        if col is None: raise ValueError("无10年列")
+        df = df.rename(columns={"日期":"date", col:"yield_10y"})
+        df["date"] = pd.to_datetime(df["date"])
+        df["yield_10y"] = pd.to_numeric(df["yield_10y"], errors="coerce")
+        df = df[["date","yield_10y"]].dropna()
+        logger.info("国债(中债): %d行 %.2f%%", len(df), df["yield_10y"].iloc[-1])
+        return _v(df, "国债")
+    except Exception as e:
+        last_err = str(e)[:80]
+
+    raise RuntimeError(f"国债收益率: 所有数据源失败 ({last_err})")
 
 
 # ============================================================
