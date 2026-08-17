@@ -66,7 +66,19 @@ if __name__ == "__main__":
         else:
             print(f"\n  🧊 冰点: 无 → 等待回调")
 
-        if signal['bubble']:
+        if signal.get('leg_300') or signal.get('leg_2000'):
+            for name, leg in [('沪深300', signal.get('leg_300')), ('中证2000', signal.get('leg_2000'))]:
+                if leg is None:
+                    continue
+                if leg.get('is_bubble'):
+                    print(f"  ⚠️ {name}: {leg['level']}（PE分位{leg['pe_pct']:.0%}）")
+                    for r in leg['reasons'][:3]:
+                        print(f"     - {r}")
+                elif leg.get('recovery'):
+                    print(f"  ↩️ {name}: {leg['level']} → 回补窗口")
+                else:
+                    print(f"  ✅ {name}: 无卖出信号（{leg['level']}）")
+        elif signal['bubble']:
             print(f"  ⚠️ 泡沫: {signal['bubble_level']}")
             for r in signal['bubble_reasons']:
                 print(f"     - {r}")
@@ -75,6 +87,9 @@ if __name__ == "__main__":
 
         print(f"\n  >>> {signal['position_advice']}")
         print(f"      CSI300: {signal['action_300']}  |  CSI2000: {signal['action_2000']}")
+
+        if a_data.get('bond_yield_10y') is None:
+            print(f"  ⚠️ 国债收益率数据缺失（所有新鲜源失效），ERP维度已跳过——宁缺毋滥，未使用停更数据")
 
         # ═══════════════════════════════════
         # 历史冰点回顾

@@ -322,13 +322,21 @@ def fetch_fed_rate(force=False):
 # 一键拉取
 # ═══════════════════════════════════════════════════════════════
 
+# 数据置信度规则（用户铁律 2026-08-17）:
+# ≤7天   → 正常使用
+# 7~20天 → 醒目警告（置信度降低）
+# >20天  → 抛弃（宁可报错也不用滞后数据）
+CACHE_MAX_AGE_DAYS = 20
+CACHE_CONFIDENCE_WARN_DAYS = 7
+
+
 def _safe_fetch(fetcher, name, force, **kwargs):
-    """安全拉取：失败时尝试缓存。"""
+    """安全拉取：失败时尝试缓存（超龄缓存宁缺毋滥，直接报错）。"""
     try:
         return fetcher(force=force, **kwargs)
     except Exception as e:
         logger.warning("%s 拉取失败: %s，尝试缓存...", name, str(e)[:80])
-        # 强制读缓存（忽略过期）
+        # 强制读缓存（年龄门禁在 _load_any 内统一执行）
         if "fx" in name.lower():
             return _load_any("fx_daily.parquet")
         elif "spread" in name.lower():
@@ -344,11 +352,21 @@ def _safe_fetch(fetcher, name, force, **kwargs):
         raise
 
 
-def _load_any(fname):
-    """无论缓存是否过期都加载。"""
+def _load_any(fname, max_age_days=CACHE_MAX_AGE_DAYS):
+    """无论缓存是否过期都加载，但执行年龄门禁：
+    超过 max_age_days 天（默认20天）的缓存无置信度 → 宁可报错也不用。"""
     p = DATA_DIR / fname
     if p.exists():
-        logger.info("使用缓存: %s", fname)
+        age = (datetime.now() - datetime.fromtimestamp(p.stat().st_mtime)).days
+        if age > max_age_days:
+            raise RuntimeError(
+                f"缓存 {fname} 已滞后 {age} 天（上限 {max_age_days} 天）"
+                f"——宁缺毋滥，拒绝使用陈旧数据")
+        if age > CACHE_CONFIDENCE_WARN_DAYS:
+            logger.warning("⚠ 缓存 %s 已滞后 %d 天（>%d天），置信度降低，请检查数据源",
+                           fname, age, CACHE_CONFIDENCE_WARN_DAYS)
+        else:
+            logger.info("使用缓存: %s (缓存%d天)", fname, age)
         return pd.read_parquet(p)
     raise RuntimeError(f"无缓存且拉取失败: {fname}")
 

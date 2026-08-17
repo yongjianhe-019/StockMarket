@@ -1,5 +1,5 @@
 """
-卖出信号 v4 — 多维度泡沫检测器
+卖出信号 v5 — 多维度泡沫检测器（分标的 + 回补）
 
 泡沫的定义：估值贵 + (价格加速/量价背离/宏观恶化/流动性狂热) ≥2 类 → 泡沫确认
 v4 新增（2026-08-12 优化）：
@@ -8,6 +8,12 @@ v4 新增（2026-08-12 优化）：
   在快泡沫中永不触发，导致 2015 股灾满仓扛过）
 - 趋势兜底：PE>60%分位 且 跌破MA60且MA60拐头 → 直接泡沫确认
   即使 A/B/C/D 检测器全部漏判，趋势破坏也强制卖出
+
+v5 新增（2026-08-17 优化，实盘样本驱动）：
+- 分标的判断：沪深300仓位看 CSI300 日线，中证2000仓位看 159531 ETF 日线
+  （2026-08-17 实盘教训：300趋势破坏一刀切卖出2000，当日2000 +2.4%）
+- 回补规则：趋势破坏减仓后，标的回站MA60且MA60拐头向上 → 回补信号
+- PE门槛保留为全市场背景条件（CSI300 PE 分位>60%）
 
 借鉴：
 - 广发证券：PE见顶先于价格见顶，真正的顶部=盈利增速拐点+情绪极端
@@ -28,63 +34,95 @@ import pandas as pd
 
 
 def is_bubble(macro_df: pd.DataFrame, csi300_val=None, csi2000_val=None,
-              idx: int = -1, daily_300: pd.DataFrame = None) -> dict:
+              idx: int = -1, daily_300: pd.DataFrame = None,
+              daily_2000: pd.DataFrame = None) -> dict:
     """
-    多维度泡沫检测。
+    多维度泡沫检测 v5 — 分标的卖出 + 回补规则
+
+    v5 (2026-08-17, 实盘样本修复):
+    - 趋势兜底按持仓标的各自判断: 沪深300仓位看 daily_300，
+      中证2000仓位看 daily_2000（etf_159531 日线），不再一刀切。
+    - 新增回补规则: 趋势破坏减仓后，标的回站MA60且MA60拐头向上 → 回补。
+    - 保留全市场估值门槛: CSI300 PE 分位>60%（PE<60%永不激活）。
 
     Parameters
     ----------
     macro_df : 宏观数据
-    csi300_val : CSI300 估值数据
-    daily_300 : CSI300 日线数据（用于价格加速和量价背离检测）
-    idx : 当前日期在 macro_df 中的索引
+    csi300_val : CSI300 估值数据（全市场估值门槛）
+    csi2000_val : 预留（中证2000无可靠估值数据，暂未使用）
+    daily_300 : CSI300 日线（沪深300仓位的价格数据）
+    daily_2000 : 中证2000 ETF(159531) 日线（中证2000仓位的价格数据）
 
     Returns
     -------
-    {
-        is_bubble: bool,
-        level: str,          # 轻度泡沫 / 中度泡沫 / 严重泡沫
-        sell_pct: float,     # 建议卖出比例 (0.25/0.50/0.75)
-        reasons: [str],
-        signals: dict,       # 各类信号详情
-        pe_pct: float,
-    }
+    daily_2000 不传时: 与 v4 相同的顶层 dict（回测向后兼容）。
+    daily_2000 传入时: 顶层 = leg_300（兼容），另加:
+        leg_300 / leg_2000: {
+            is_bubble: bool,       # 需卖出（泡沫或趋势破坏）
+            signal_type: 'bubble'|'trend_breakdown'|'trend_recovery'|None,
+            level: str,
+            sell_pct: float,       # 减仓比例（回补/持有为0）
+            reasons: [str],
+            signals: dict,
+            pe_pct: float,
+            recovery: bool,        # 回补信号
+        }
     """
     hist = macro_df.iloc[:max(idx + 1, 1)] if idx >= 0 else macro_df
     row = hist.iloc[-1]
 
-    # ═══════════════════════════════════════
-    # 前提：PE 必须贵 (>60% 分位)
-    # ═══════════════════════════════════════
+    # 全市场估值门槛（CSI300 PE 分位）
     pe_pct = _pe_percentile(csi300_val, row['date'])
+    # C类宏观恶化: 全市场共享
+    signals_c = _check_macro_deterioration(hist)
+
+    leg_300 = _compute_leg(hist, row['date'], pe_pct, signals_c, daily_300)
+    if daily_2000 is None:
+        return leg_300  # 向后兼容: 与 v4 输出结构一致
+
+    leg_2000 = _compute_leg(hist, row['date'], pe_pct, signals_c, daily_2000)
+    result = dict(leg_300)
+    result['leg_300'] = leg_300
+    result['leg_2000'] = leg_2000
+    return result
+
+
+def _compute_leg(hist: pd.DataFrame, date, pe_pct, signals_c: list,
+                 daily: pd.DataFrame) -> dict:
+    """按单个标的日线计算卖出/回补信号（PE门槛为全市场背景条件）。"""
+    recovery = _check_trend_recovery(daily, date) if daily is not None else False
+
+    # ═══════════════════════════════════════
+    # 前提：PE 必须贵 (>60% 分位) —— 全市场背景
+    # ═══════════════════════════════════════
     if pe_pct is None or pe_pct < 0.60:
         return {
-            "is_bubble": False, "signal_type": None,
-            "level": "PE合理", "sell_pct": 0.0,
-            "reasons": [], "signals": {}, "pe_pct": pe_pct,
+            "is_bubble": False,
+            "signal_type": "trend_recovery" if recovery else None,
+            "level": "趋势修复·回补" if recovery else "PE合理",
+            "sell_pct": 0.0,
+            "reasons": ["回站MA60且MA60拐头向上(趋势修复)"] if recovery else [],
+            "signals": {},
+            "pe_pct": pe_pct,
+            "recovery": recovery,
         }
 
     # ═══════════════════════════════════════
     # A类: 价格加速赶顶（动量泡沫）
     # ═══════════════════════════════════════
-    signals_a = _check_price_acceleration(daily_300, row['date']) if daily_300 is not None else []
+    signals_a = _check_price_acceleration(daily, date) if daily is not None else []
 
     # ═══════════════════════════════════════
     # B类: 量价背离（资金离场）
     # ═══════════════════════════════════════
-    signals_b = _check_volume_divergence(daily_300, row['date']) if daily_300 is not None else []
+    signals_b = _check_volume_divergence(daily, date) if daily is not None else []
 
-    # ═══════════════════════════════════════
-    # C类: 宏观恶化（基本面拐点 — 保留原有）
-    # ═══════════════════════════════════════
-    signals_c = _check_macro_deterioration(hist)
+    # D类: 流动性/杠杆狂热（两融=全市场共享，成交量=本标的）
+    signals_d = _check_liquidity_frenzy(hist, daily, date) if daily is not None else \
+        _check_liquidity_frenzy(hist, None, date)
 
-    # D类: 流动性/杠杆狂热（v4 新增 — 补 2015 式杠杆牛盲区）
-    signals_d = _check_liquidity_frenzy(hist, daily_300, row['date']) if daily_300 is not None else \
-        _check_liquidity_frenzy(hist, None, row['date'])
-
-    # 趋势兜底（v4 新增）：PE贵 + 跌破MA60且MA60拐头 → 强制泡沫
-    trend_breakdown = _check_trend_breakdown(daily_300, row['date']) if daily_300 is not None else False
+    # 趋势兜底（v4 新增）：PE贵 + 本标的跌破MA60且MA60拐头 → 强制泡沫
+    trend_breakdown = _check_trend_breakdown(daily, date) if daily is not None else False
 
     # ═══════════════════════════════════════
     # 汇总判断：≥2 类触发 → 泡沫
@@ -124,6 +162,7 @@ def is_bubble(macro_df: pd.DataFrame, csi300_val=None, csi2000_val=None,
                 "总信号数": total_count,
             }),
             "pe_pct": pe_pct,
+            "recovery": False,
         }
 
     if categories_triggered >= 2:
@@ -145,17 +184,36 @@ def is_bubble(macro_df: pd.DataFrame, csi300_val=None, csi2000_val=None,
                 "总信号数": total_count,
             }),
             "pe_pct": pe_pct,
+            "recovery": False,
         }
-    else:
+
+    if recovery:
+        # 回补规则（v5 新增）：趋势破坏减仓后，趋势修复 → 恢复仓位
         return {
             "is_bubble": False,
-            "signal_type": None,
-            "level": f"PE偏高但仅{categories_triggered}/4类触发",
+            "signal_type": "trend_recovery",
+            "level": "趋势修复·回补",
             "sell_pct": 0.0,
-            "reasons": all_signals,
-            "signals": signal_pack,
+            "reasons": ["回站MA60且MA60拐头向上(趋势修复)"],
+            "signals": dict(signal_pack, **{
+                "趋势修复": ["回站MA60且MA60拐头向上"],
+                "触发类别数": categories_triggered,
+                "总信号数": total_count,
+            }),
             "pe_pct": pe_pct,
+            "recovery": True,
         }
+
+    return {
+        "is_bubble": False,
+        "signal_type": None,
+        "level": f"PE偏高但仅{categories_triggered}/4类触发",
+        "sell_pct": 0.0,
+        "reasons": all_signals,
+        "signals": signal_pack,
+        "pe_pct": pe_pct,
+        "recovery": False,
+    }
 
 
 # ═══════════════════════════════════════════
@@ -383,6 +441,34 @@ def _check_trend_breakdown(daily: pd.DataFrame, date) -> bool:
 
     # 跌破 MA60 且 MA60 拐头向下
     return current < ma60_now and ma60_now < ma60_prev
+
+
+def _check_trend_recovery(daily: pd.DataFrame, date, lookback: int = 250) -> bool:
+    """
+    趋势修复检测（v5 新增 — 回补规则）: 收盘价回站 MA60 且 MA60 拐头向上，
+    且近 lookback 个交易日内出现过趋势破坏（否则只是普通上涨，不叫"回补"）。
+    """
+    if daily is None or daily.empty:
+        return False
+
+    d = daily[daily['date'] <= date]
+    if len(d) < 80:
+        return False
+
+    close = d['close']
+    ma60 = close.rolling(60).mean()
+    ma60_prev = ma60.shift(20)
+    current = float(close.iloc[-1])
+    ma60_now = float(ma60.iloc[-1])
+    ma60_past = float(ma60_prev.iloc[-1])
+
+    # 回站 MA60 且 MA60 拐头向上
+    if not (current > ma60_now and ma60_now > ma60_past):
+        return False
+
+    # 近 lookback 个交易日内曾出现趋势破坏
+    breakdown = (close < ma60) & (ma60 < ma60_prev)
+    return bool(breakdown.tail(lookback).any())
 
 
 def _pe_percentile(val_df, date):

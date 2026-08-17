@@ -169,6 +169,10 @@ def fetch_csi2000_daily(force=False):
         if df_hist.empty:
             raise RuntimeError("CSI2000: 所有数据源均失败")
         df = df_hist
+        lag_days = (datetime.now() - df_hist["date"].iloc[-1]).days
+        logger.warning("⚠ CSI2000指数数据滞后%d天（%s截止）——近期段由ETF 159531反推补丁覆盖"
+                       "(dashboard逻辑)，非补丁路径请勿直接使用",
+                       lag_days, df_hist["date"].iloc[-1].date())
 
     logger.info("CSI2000: %d行 %s~%s", len(df),
                 df["date"].min().strftime("%Y-%m-%d"), df["date"].max().strftime("%Y-%m-%d"))
@@ -396,17 +400,53 @@ def _find_col(df, candidates):
     return None
 
 
+def _bond_is_fresh(df: pd.DataFrame) -> bool:
+    """校验数据新鲜度: 最后日期距今 ≤7 天。"""
+    if df is None or df.empty or "date" not in df.columns:
+        return False
+    return (datetime.now() - pd.Timestamp(df["date"].iloc[-1])).days <= 7
+
+
+def _bond_yield_from_spread(path) -> Optional[pd.DataFrame]:
+    """从宏观路径的 bond_spread.parquet 提取 cn_10y（同一底层源，独立抓取路径）。"""
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        raw = pd.read_parquet(p)
+        row = raw[["date", "cn_10y"]].dropna().sort_values("date").iloc[-1:]
+        if row.empty:
+            return None
+        df = pd.DataFrame({
+            "date": pd.to_datetime(row["date"]),
+            "yield_10y": pd.to_numeric(row["cn_10y"], errors="coerce"),
+        }).dropna(subset=["yield_10y"])
+        if not _bond_is_fresh(df):
+            logger.warning("国债spread兜底: 数据停更于%s，弃用", df["date"].iloc[-1].date())
+            return None
+        return _v(df, "国债-spread")
+    except Exception as e:
+        logger.warning("国债spread兜底: %s", str(e)[:80])
+        return None
+
+
 def fetch_bond_yield_10y():
     """
-    10年国债收益率，多渠道降级:
-    1. bond_zh_us_rate (datacenter-web, 1990至今) — 当前可用
-    2. bond_china_yield (中债, 2020-2021 已停更) — 仅作回退
+    10年国债收益率 — 宁缺毋滥原则（2026-08-17 数据治理）:
+
+    1. bond_zh_us_rate 主源（datacenter，1990至今）——需≤7天内
+    2. 本地缓存（上次成功值）——需≤7天内
+    3. bond_spread.parquet 的 cn_10y（宏观路径，同一底层源）——需≤7天内
+    全部失效 → 返回 None + 醒目告警（ERP维度自动跳过，模型安全降级）。
+
+    停更源 bond_china_yield（2021年冻结）已永久移除——绝不使用停更数据。
     """
-    import akshare as ak
+    cache = "bond_yield_10y.parquet"
     last_err = None
 
-    # 1) 主源: 中美利差接口的 cn_10y（东财 datacenter，验证可用至昨日）
+    # 1) 主源: 中美利差接口的 cn_10y（东财 datacenter）
     try:
+        import akshare as ak
         raw = ak.bond_zh_us_rate()
         df = pd.DataFrame({
             "date": pd.to_datetime(raw["日期"]),
@@ -414,7 +454,8 @@ def fetch_bond_yield_10y():
         }).dropna(subset=["yield_10y"])
         df = df.sort_values("date").reset_index(drop=True)
         # 校验新鲜度: 数据必须更新到近7天内，否则视为源失效
-        if (datetime.now() - df["date"].iloc[-1]).days <= 7:
+        if _bond_is_fresh(df):
+            _save(df, cache)
             logger.info("国债: %d行 %s~%s 最新=%.2f%%",
                         len(df), df["date"].min().strftime("%Y-%m-%d"),
                         df["date"].max().strftime("%Y-%m-%d"), df["yield_10y"].iloc[-1])
@@ -423,21 +464,30 @@ def fetch_bond_yield_10y():
     except Exception as e:
         last_err = str(e)[:80]
 
-    # 2) 回退: 中债信息网
-    try:
-        df = ak.bond_china_yield()
-        col = next((c for c in df.columns if "10" in str(c)), None)
-        if col is None: raise ValueError("无10年列")
-        df = df.rename(columns={"日期":"date", col:"yield_10y"})
-        df["date"] = pd.to_datetime(df["date"])
-        df["yield_10y"] = pd.to_numeric(df["yield_10y"], errors="coerce")
-        df = df[["date","yield_10y"]].dropna()
-        logger.info("国债(中债): %d行 %.2f%%", len(df), df["yield_10y"].iloc[-1])
-        return _v(df, "国债")
-    except Exception as e:
-        last_err = str(e)[:80]
+    # 2) 缓存（上次成功值，按内嵌日期校验新鲜度，不按文件修改时间）
+    p = _cp(cache)
+    if p.exists():
+        try:
+            cached = pd.read_parquet(p)
+            if _bond_is_fresh(cached):
+                age = (datetime.now() - pd.Timestamp(cached["date"].iloc[-1])).days
+                logger.warning("国债主源失效(%s)，使用缓存(%.2f%%, %d天前)",
+                               last_err, float(cached["yield_10y"].iloc[-1]), age)
+                return _v(cached, "国债-缓存")
+            logger.warning("国债缓存停更于%s，弃用", cached["date"].iloc[-1].date())
+        except Exception as e:
+            logger.warning("国债缓存读取失败: %s", str(e)[:80])
 
-    raise RuntimeError(f"国债收益率: 所有数据源失败 ({last_err})")
+    # 3) 宏观路径 bond_spread 的 cn_10y（同一底层源，独立抓取路径）
+    spread = _bond_yield_from_spread(_cp("bond_spread.parquet"))
+    if spread is not None:
+        logger.warning("国债主源失效(%s)，使用宏观路径利差表 cn_10y=%.2f%%",
+                       last_err, float(spread["yield_10y"].iloc[-1]))
+        return spread
+
+    logger.error("⚠️ 国债收益率: 所有新鲜数据源失效(%s)，返回None——ERP维度将跳过。"
+                 "宁缺毋滥，绝不使用停更数据。", last_err)
+    return None
 
 
 # ============================================================

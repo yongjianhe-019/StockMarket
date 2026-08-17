@@ -89,17 +89,21 @@ def _get_pe_pct(val_df, date):
 
 def detect_bubble(data: dict, macro_df: pd.DataFrame, date) -> dict:
     """
-    检测泡沫卖出信号。
+    检测泡沫卖出信号（v5 分标的）。
 
-    前提：PE分位 > 60%（必须先贵）
-    三分类确认：A.价格加速  B.量价背离  C.宏观恶化
+    前提：PE分位 > 60%（全市场背景，CSI300 估值）
+    三分类确认：A.价格加速  B.量价背离  C.宏观恶化  D.流动性狂热
     ≥2 类触发 → 泡沫确认
+    趋势兜底/回补：按持仓标的各自日线判断
+      - 沪深300仓位: csi300_daily
+      - 中证2000仓位: etf_159531 日线
 
-    Returns {is_bubble: bool, level: str, sell_pct: float, reasons: [...]}
+    Returns {is_bubble, level, sell_pct, reasons, ..., leg_300, leg_2000}
     """
     return is_bubble(macro_df, data.get('csi300_valuation'),
                      idx=macro_df['date'].searchsorted(date),
-                     daily_300=data.get('csi300_daily'))
+                     daily_300=data.get('csi300_daily'),
+                     daily_2000=data.get('etf_159531'))
 
 
 # ═══════════════════════════════════
@@ -130,17 +134,34 @@ def generate_signal(data: dict, macro_df: pd.DataFrame,
     ice = detect_ice_point(data, macro_df, date)
     bubble = detect_bubble(data, macro_df, date)
 
-    action_300 = 'SELL' if bubble['is_bubble'] else ('BUY' if ice['csi300'] else 'HOLD')
-    action_2000 = 'SELL' if bubble['is_bubble'] else ('BUY' if ice['csi2000'] else 'HOLD')
+    # v5 分标的: 有 leg 时用各自腿，否则回退到旧的市场级信号
+    leg_300 = bubble.get('leg_300', bubble)
+    leg_2000 = bubble.get('leg_2000', bubble)
+
+    def _action(leg, ice_flag):
+        if leg.get('is_bubble'):
+            return 'SELL'
+        if leg.get('recovery'):
+            return 'RESTORE'  # 回补: 趋势破坏减仓后趋势修复
+        return 'BUY' if ice_flag else 'HOLD'
+
+    action_300 = _action(leg_300, ice['csi300'])
+    action_2000 = _action(leg_2000, ice['csi2000'])
 
     buying = [e for e, ice in [('沪深300', ice['csi300']), ('中证2000', ice['csi2000'])] if ice]
-    if bubble['is_bubble']:
-        sell_pct = bubble.get('sell_pct', 0.5)
-        if bubble.get('signal_type') == 'trend_breakdown':
-            # 趋势破坏是独立风控信号，非泡沫极端信号
-            advice = f"📉 {bubble['level']}: {'; '.join(bubble['reasons'][:2])} → 风控减仓{sell_pct:.0%}（非泡沫信号）"
-        else:
-            advice = f"⚠️ {bubble['level']}: {'; '.join(bubble['reasons'][:3])} → 卖出{sell_pct:.0%}"
+    advice_parts = []
+    for name, leg, act in [('沪深300', leg_300, action_300), ('中证2000', leg_2000, action_2000)]:
+        if act == 'SELL':
+            sell_pct = leg.get('sell_pct', 0.5)
+            if leg.get('signal_type') == 'trend_breakdown':
+                # 趋势破坏是独立风控信号，非泡沫极端信号
+                advice_parts.append(f"📉 {name}: {leg['level']} → 风控减仓{sell_pct:.0%}（非泡沫信号）")
+            else:
+                advice_parts.append(f"⚠️ {name}: {leg['level']} → 卖出{sell_pct:.0%}")
+        elif act == 'RESTORE':
+            advice_parts.append(f"↩️ {name}: {leg['level']} → 回补（恢复减仓前仓位）")
+    if advice_parts:
+        advice = '; '.join(advice_parts)
     elif buying:
         advice = f"🧊 冰点: {'+'.join(buying)} → 分批买入"
     else:
@@ -159,6 +180,8 @@ def generate_signal(data: dict, macro_df: pd.DataFrame,
         'bubble_sell_pct': bubble.get('sell_pct', 0.5),
         'bubble_reasons': bubble.get('reasons', []),
         'bubble_signals': bubble.get('signals', {}),
+        'leg_300': leg_300,
+        'leg_2000': leg_2000,
         'action_300': action_300,
         'action_2000': action_2000,
         'position_advice': advice,
