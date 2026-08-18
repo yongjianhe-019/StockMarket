@@ -22,11 +22,14 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CACHE_AGE = 1  # 天
 
 
-def _load(fname):
+def _load(fname, now=None):
+    """1天缓存，按日历日过期：昨天（含昨晚深夜）写入的缓存，今天一律视为过期。"""
     p = DATA_DIR / fname
     if not p.exists():
         return None
-    if (datetime.now() - datetime.fromtimestamp(p.stat().st_mtime)).days >= CACHE_AGE:
+    now = now or datetime.now()
+    mtime_date = datetime.fromtimestamp(p.stat().st_mtime).date()
+    if (now.date() - mtime_date).days >= CACHE_AGE:
         return None
     return pd.read_parquet(p)
 
@@ -330,25 +333,18 @@ CACHE_MAX_AGE_DAYS = 20
 CACHE_CONFIDENCE_WARN_DAYS = 7
 
 
-def _safe_fetch(fetcher, name, force, **kwargs):
-    """安全拉取：失败时尝试缓存（超龄缓存宁缺毋滥，直接报错）。"""
+def _safe_fetch(fetcher, name, force, cache_file=None, **kwargs):
+    """安全拉取：失败时兜底到 cache_file（超龄缓存宁缺毋滥，直接报错）。
+
+    修复 2026-08-18 实盘bug：旧版按英文关键词("fx"/"spread")匹配中文名
+    ("汇率"/"利差")永远匹配不上，缓存兜底从未生效，单源失败即整链崩溃。
+    """
     try:
         return fetcher(force=force, **kwargs)
     except Exception as e:
         logger.warning("%s 拉取失败: %s，尝试缓存...", name, str(e)[:80])
-        # 强制读缓存（年龄门禁在 _load_any 内统一执行）
-        if "fx" in name.lower():
-            return _load_any("fx_daily.parquet")
-        elif "spread" in name.lower():
-            return _load_any("bond_spread.parquet")
-        elif "gold" in name.lower():
-            return _load_any("gold_daily.parquet")
-        elif "china" in name.lower():
-            return _load_any("china_macro_monthly.parquet")
-        elif "fed" in name.lower():
-            return _load_any("fed_rate.parquet")
-        elif "margin" in name.lower() or "两融" in name:
-            return _load_any("margin_balance.parquet")
+        if cache_file is not None:
+            return _load_any(cache_file)
         raise
 
 
@@ -375,12 +371,12 @@ def fetch_all_macro(force=False):
     """拉取全部宏观数据，统一日频对齐。"""
     logger.info("==== 宏观数据拉取 ====")
 
-    fx = _safe_fetch(fetch_fx_daily, "汇率", force)
-    spread = _safe_fetch(fetch_bond_spread, "利差", force)
-    gold = _safe_fetch(fetch_gold, "黄金", force)
-    china = _safe_fetch(fetch_china_macro, "中国宏观", force)
-    fed = _safe_fetch(fetch_fed_rate, "美联储", force)
-    margin = _safe_fetch(fetch_margin_balance, "两融余额", force)
+    fx = _safe_fetch(fetch_fx_daily, "汇率", force, cache_file="fx_daily.parquet")
+    spread = _safe_fetch(fetch_bond_spread, "利差", force, cache_file="bond_spread.parquet")
+    gold = _safe_fetch(fetch_gold, "黄金", force, cache_file="gold_daily.parquet")
+    china = _safe_fetch(fetch_china_macro, "中国宏观", force, cache_file="china_macro_monthly.parquet")
+    fed = _safe_fetch(fetch_fed_rate, "美联储", force, cache_file="fed_rate.parquet")
+    margin = _safe_fetch(fetch_margin_balance, "两融余额", force, cache_file="margin_balance.parquet")
 
     # 基准日期序列（统一 ns 精度）
     df = fx[["date"]].copy().sort_values("date")

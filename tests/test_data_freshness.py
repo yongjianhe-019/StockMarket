@@ -202,5 +202,78 @@ class TestModelWithoutBond(unittest.TestCase):
         self.assertIn(sig["action_300"], ("SELL", "HOLD", "BUY", "RESTORE"))
 
 
+# ═══════════════════════════════════════════════════════════
+# 4. 缓存日历日过期 + _safe_fetch 兜底（2026-08-18 暴露的两个bug）
+# ═══════════════════════════════════════════════════════════
+
+class TestCalendarDayCache(unittest.TestCase):
+    """1天缓存必须按日历日判断：昨天23点写的缓存，今晚收盘后必须过期。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _write(self, days_ago: int):
+        """days_ago=1 → mtime设为'昨晚深夜23:30'（复现真实bug: 距今~23h被误判新鲜）。"""
+        p = Path(self.tmp.name) / "c.parquet"
+        df = pd.DataFrame({"date": [pd.Timestamp.now().normalize()], "v": [1.0]})
+        _write_parquet(p, df)
+        if days_ago == 1:
+            t = (datetime.now() - timedelta(days=1)).replace(hour=23, minute=30)
+        else:
+            t = datetime.now() - timedelta(days=days_ago)
+        os.utime(p, (t.timestamp(), t.timestamp()))
+        return str(p)
+
+    def test_data_fetcher_yesterday_mtime_is_stale(self):
+        """昨晚深夜写入的缓存 → 今晚必须视为过期（回归: 8/17数据冒充8/18）。"""
+        p = self._write(1)
+        self.assertIsNone(data_fetcher._load(p))
+
+    def test_data_fetcher_today_mtime_fresh(self):
+        self._write(0)
+        self.assertIsNotNone(data_fetcher._load(self._write(0)))
+
+    def test_macro_fetcher_yesterday_mtime_is_stale(self):
+        p = self._write(1)
+        self.assertIsNone(macro_fetcher._load(p))
+
+    def test_macro_fetcher_today_mtime_fresh(self):
+        p = self._write(0)
+        self.assertIsNotNone(macro_fetcher._load(p))
+
+
+class TestSafeFetchFallback(unittest.TestCase):
+    """_safe_fetch: 抓取失败必须真的兜底到缓存（中文名分发bug回归）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _write(self, days_ago: int = 0):
+        p = Path(self.tmp.name) / "bond_spread.parquet"
+        df = pd.DataFrame({"date": [pd.Timestamp.now().normalize()], "cn_10y": [1.7]})
+        _write_parquet(p, df)
+        t = datetime.now() - timedelta(days=days_ago)
+        os.utime(p, (t.timestamp(), t.timestamp()))
+        return str(p)
+
+    def test_falls_back_to_cache_on_failure(self):
+        def boom(force=False):
+            raise RuntimeError("源挂了")
+        p = self._write(0)
+        df = macro_fetcher._safe_fetch(boom, "利差", False, cache_file=p)
+        self.assertIsNotNone(df)
+        self.assertAlmostEqual(float(df["cn_10y"].iloc[-1]), 1.7)
+
+    def test_stale_cache_raises(self):
+        """兜底缓存超过20天 → 宁缺毋滥，报错。"""
+        def boom(force=False):
+            raise RuntimeError("源挂了")
+        p = self._write(25)
+        with self.assertRaisesRegex(RuntimeError, "宁缺毋滥"):
+            macro_fetcher._safe_fetch(boom, "利差", False, cache_file=p)
+
+
 if __name__ == "__main__":
     unittest.main()

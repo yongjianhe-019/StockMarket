@@ -33,10 +33,17 @@ CACHE_AGE = 1
 def _cp(f): return DATA_DIR / f
 
 
-def _load(f):
+def _load(f, now=None):
+    """1天缓存，按日历日过期：昨天（含昨晚深夜）写入的缓存，今天一律视为过期。
+
+    修复 2026-08-18 实盘bug：昨晚23:16写入的缓存距今晚22:35不足24小时，
+    旧逻辑(.days>=1)判为"新鲜"，导致8/17数据冒充8/18用于当日分析。
+    """
     p = _cp(f)
     if not p.exists(): return None
-    if (datetime.now() - datetime.fromtimestamp(p.stat().st_mtime)).days >= CACHE_AGE:
+    now = now or datetime.now()
+    mtime_date = datetime.fromtimestamp(p.stat().st_mtime).date()
+    if (now.date() - mtime_date).days >= CACHE_AGE:
         return None
     return pd.read_parquet(p)
 
