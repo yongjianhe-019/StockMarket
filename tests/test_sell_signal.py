@@ -20,7 +20,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from macro.sell_signal import is_bubble, _check_trend_recovery  # noqa: E402
+from macro.sell_signal import is_bubble, _check_trend_recovery, _check_recovery_level  # noqa: E402
 from strategy import generate_signal  # noqa: E402
 
 
@@ -176,6 +176,64 @@ class TestTrendRecovery(unittest.TestCase):
         daily = pd.DataFrame({"date": dates, "open": close, "close": close,
                               "high": close, "low": close, "volume": 1e6})
         self.assertFalse(_check_trend_recovery(daily, daily["date"].iloc[-1]))
+
+
+# ═══════════════════════════════════════════════════════════
+# 2b. 回补阶梯化（v6, 2026-08-28）
+# ═══════════════════════════════════════════════════════════
+
+def _synth_v_recovery(n2: int = 40, end: float = 55.0) -> pd.DataFrame:
+    """200天下跌100→50 + n2天反弹50→end，反弹段量能回升。
+
+    v6 回补三档（V 型中按自然时序分层，解决 v5 单档右侧追高）:
+      档1: 站回MA20+量能回升(连续2日) → 档2: 站回MA60(连续2日) → 档3: MA60拐头
+    """
+    n1 = 200
+    dates = pd.bdate_range("2025-01-01", periods=n1 + n2)
+    close = np.concatenate([np.linspace(100.0, 50.0, n1), np.linspace(50.0, end, n2)])
+    vol = np.full(n1 + n2, 1e6)
+    vol[n1:] = 1e6 * (1 + np.arange(n2) / n2 * 0.5)  # 反弹段量能回升
+    return pd.DataFrame({"date": dates, "open": close, "close": close,
+                         "high": close * 1.001, "low": close * 0.999, "volume": vol})
+
+
+class TestRecoveryLadder(unittest.TestCase):
+    """v6 回补阶梯: 档位按自然时序递进（1→2→3），末档=最严条件。"""
+
+    def test_ladder_levels_1_2_progression(self):
+        """温和反弹(50→55): 全序出现过档1与档2，末档=2（站回MA60但MA60未拐头）。"""
+        daily = _synth_v_recovery(n2=40, end=55.0)
+        seen = set()
+        for d in daily["date"]:
+            lv, pct = _check_recovery_level(daily, d)
+            seen.add(lv)
+        # 档1（站回MA20）与档2（站回MA60）都出现过；档3（MA60拐头）不出现
+        self.assertIn(1, seen)
+        self.assertIn(2, seen)
+        self.assertNotIn(3, seen)
+        lv, pct = _check_recovery_level(daily, daily["date"].iloc[-1])
+        self.assertEqual(lv, 2)
+        self.assertAlmostEqual(pct, 2 / 3)
+
+    def test_ladder_reaches_level3_ma60_turn(self):
+        """强反弹(50→130): MA60 拐头 → 末档=3，累计回补 100%。"""
+        daily = _synth_v_recovery(n2=120, end=130.0)
+        lv, pct = _check_recovery_level(daily, daily["date"].iloc[-1])
+        self.assertEqual(lv, 3)
+        self.assertEqual(pct, 1.0)
+        # bool 包装器兼容: 档3 → recovery=True
+        self.assertTrue(_check_trend_recovery(daily, daily["date"].iloc[-1]))
+
+    def test_ladder_2026_08_17_real(self):
+        """真实场景(2026-08-17): 8/14+8/17 连续两日站回MA60 → 档2（v5语义需等MA60拐头→升级为早确认）。"""
+        etf531 = pd.read_parquet(ROOT / "data/etf_159531_daily.parquet")
+        etf531["date"] = pd.to_datetime(etf531["date"])
+        lv, pct = _check_recovery_level(etf531, pd.Timestamp("2026-08-17"))
+        self.assertEqual(lv, 2)
+        self.assertAlmostEqual(pct, 2 / 3)
+        # 8/14: 量能未回升(条件3) → 档0，v5 的 8/14 测试语义保持不变
+        lv, _ = _check_recovery_level(etf531, pd.Timestamp("2026-08-14"))
+        self.assertEqual(lv, 0)
 
 
 # ═══════════════════════════════════════════════════════════

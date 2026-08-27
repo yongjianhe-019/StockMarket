@@ -146,10 +146,16 @@ def fetch_csi2000_daily(force=False):
 
     import akshare as ak
 
-    # 1) csindex 历史（稳定）
+    # 1) csindex 历史（稳定）——显式传日期窗口（2026-08-28 修复: akshare 该函数
+    #    默认窗口硬编码为 20180526~20240604，东财备源挂掉时会把文件截断成该窗口
+    #    （8/27 文件 3079 行被覆盖成 1463 行）。指数基日 2013-12-31，接口支持任意窗口。
     df_hist = pd.DataFrame()
     try:
-        df = ak.stock_zh_index_hist_csindex(symbol="932000")
+        df = ak.stock_zh_index_hist_csindex(
+            symbol="932000",
+            start_date="20131231",
+            end_date=datetime.now().strftime("%Y%m%d"),
+        )
         df = df.rename(columns={"日期":"date","开盘":"open","收盘":"close",
                                 "最高":"high","最低":"low","成交量":"volume","成交额":"amount"})
         df["date"] = pd.to_datetime(df["date"])

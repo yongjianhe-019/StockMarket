@@ -159,7 +159,10 @@ def generate_signal(data: dict, macro_df: pd.DataFrame,
             else:
                 advice_parts.append(f"⚠️ {name}: {leg['level']} → 卖出{sell_pct:.0%}")
         elif act == 'RESTORE':
-            advice_parts.append(f"↩️ {name}: {leg['level']} → 回补（恢复减仓前仓位）")
+            # v6 回补阶梯化: 档位越高累计回补比例越高（档1=1/3 → 档2=2/3 → 档3=3/3）
+            pct = leg.get('recovery_pct', 1 / 3)
+            advice_parts.append(f"↩️ {name}: {leg['level']} → 回补（累计回补{pct:.0%}；"
+                                f"冰点出现时按分数档位优先）")
     if advice_parts:
         advice = '; '.join(advice_parts)
     elif buying:
@@ -173,6 +176,8 @@ def generate_signal(data: dict, macro_df: pd.DataFrame,
         'ice_2000': ice['csi2000'],
         'score_300': ice['score_300'],
         'score_2000': ice['score_2000'],
+        'details_300': ice.get('details_300', {}),
+        'details_2000': ice.get('details_2000', {}),
         'pe_pct_300': ice['pe_pct_300'],
         'bubble': bubble['is_bubble'],
         'bubble_signal_type': bubble.get('signal_type'),

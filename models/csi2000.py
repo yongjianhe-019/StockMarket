@@ -112,6 +112,13 @@ def compute_csi2000_score(daily: pd.DataFrame,
                 d_macro_btm = {"状态": "宏观仍在恶化或数据不足"}
 
     # ═══════════════════════════════════════
+    # 6. 两融出清确认 (加分项, +13)
+    #    V型急跌底盲区修复(2026-08-28): 杠杆快速出清+站回MA20+量能回升 → 确认底
+    #    预研 margin_flush_study.py: 历史0飞刀、2023阴跌不触发
+    # ═══════════════════════════════════════
+    s_flush, d_flush = _score_margin_flush(daily, macro, latest_date)
+
+    # ═══════════════════════════════════════
     # 汇总
     # ═══════════════════════════════════════
     total = s_macro + s_trend + s_rs + s_struct + s_macro_btm
@@ -125,6 +132,9 @@ def compute_csi2000_score(daily: pd.DataFrame,
         penalty = min(s_trend * 0.5, 10)  # 趋势不可信，最多扣10分
         total -= penalty
         d_trend["趋势质量惩罚"] = f"R²={r2_val:.2f}<0.3，动量打折 -{penalty:.0f}分"
+
+    # 确认类加分在 R² 惩罚之后：动量质量差只惩罚动量分，不影响出清确认
+    total += s_flush
 
     if total >= SCORE_BUY:
         season, action = "深冬", "补仓"
@@ -145,6 +155,7 @@ def compute_csi2000_score(daily: pd.DataFrame,
             "相对强弱(20)": d_rs,
             "市场结构(15)": d_struct,
             "宏观底部确认(+5)": d_macro_btm,
+            "两融出清确认(+13)": d_flush,
         },
         "price": price_latest,
         "signal_date": latest_date,
@@ -345,6 +356,96 @@ def _score_market_structure(daily: pd.DataFrame) -> tuple[float, dict]:
         "成交量": f"20日均/60日均={vol_ratio_v:.2f}",
         "得分": s,
     }
+
+
+# ═══════════════════════════════════════════
+# 入口
+# ═══════════════════════════════════════════
+
+# ═══════════════════════════════════════════
+# 维度 6: 两融出清确认 (加分项, +13)
+# ═══════════════════════════════════════════
+
+def _score_margin_flush(daily: pd.DataFrame, macro: pd.DataFrame,
+                        latest_date) -> tuple[float, dict]:
+    """
+    两融出清确认 (+13, 2026-08-28 新增): 杠杆快速出清后的 V 型急跌底确认。
+
+    触发条件（全部满足）:
+      1. 两融余额距6月高点回撤 >10%（126交易日窗口；两融行数≥60；
+         最新两融日期距信号日 ≤7 天——新鲜度校验，防缓存冻结）
+      2. 收盘价站回 MA20（日线 ≥80 行）
+      3. 5日均量 > 20日均量（量能回升；volume 列缺失时跳过）
+    冷却: 最近 60 自然日内已出现过三条件全满足 → 不加分（防连续触发叠加）
+
+    注: 拼接补丁段 volume 为 ETF 量纲与指数段不同，拼接后 20 日内量能判断
+    降级（比率类判断不敏感；实际加分触发点都在拼接窗口外）。
+    """
+    if daily is None or daily.empty or len(daily) < 80:
+        return 0.0, {"状态": "数据不足(日线<80行)"}
+    if macro is None or macro.empty or 'margin_balance' not in macro.columns:
+        return 0.0, {"状态": "数据不足(无两融数据)"}
+
+    latest_date = pd.Timestamp(latest_date)
+    d = daily[daily['date'] <= latest_date].sort_values('date').reset_index(drop=True)
+    if len(d) < 80:
+        return 0.0, {"状态": "数据不足(日线<80行)"}
+
+    mb = macro[['date', 'margin_balance']].dropna().sort_values('date')
+    mb = mb[mb['date'] <= latest_date]
+    # 统一日期 dtype（parquet 可能读成 datetime64[us]，merge_asof 要求一致）
+    d['date'] = pd.to_datetime(d['date']).astype('datetime64[ns]')
+    mb['date'] = pd.to_datetime(mb['date']).astype('datetime64[ns]')
+    if len(mb) < 60:
+        return 0.0, {"状态": "数据不足(两融<60行)"}
+    lag_days = (latest_date - mb['date'].iloc[-1]).days
+    if lag_days > 7:
+        return 0.0, {"状态": f"两融数据滞后{lag_days}天>7天，跳过"}
+
+    # 按日线交易日对齐两融（asof 后向取最近值）
+    m_align = pd.merge_asof(d[['date']], mb, on='date', direction='backward')
+    mb_6m_high = m_align['margin_balance'].rolling(126, min_periods=60).max()
+    dd_from_high = m_align['margin_balance'] / mb_6m_high - 1
+    fresh = (d['date'] - m_align['date']).dt.days <= 7
+
+    close = d['close']
+    above_ma20 = (close > close.rolling(20).mean()).fillna(False)
+    triggered = ((dd_from_high < -0.10) & above_ma20 & fresh).fillna(False)
+    if 'volume' in d.columns:
+        vol_recovering = (d['volume'].rolling(5).mean()
+                          > d['volume'].rolling(20).mean()).fillna(False)
+        triggered = triggered & vol_recovering
+
+    today_trigger = bool(triggered.iloc[-1])
+    # 冷却: 60自然日内（不含今日）已有触发 → 不加分
+    cutoff = latest_date - pd.Timedelta(days=60)
+    prior = triggered[(d['date'] >= cutoff) & (d['date'] < latest_date)]
+    cooldown = bool(prior.any())
+
+    now = float(close.iloc[-1])
+    ma20 = float(close.tail(20).mean())
+    detail_base = {
+        "两融距6月高": f"{float(dd_from_high.iloc[-1]):.1%}",
+        "站回MA20": f"{'✅' if bool(above_ma20.iloc[-1]) else '❌'} {now:.0f} vs MA20 {ma20:.0f}",
+        "最新两融日": f"{m_align['date'].iloc[-1].date()}",
+    }
+
+    if today_trigger and not cooldown:
+        return 13.0, dict(detail_base, **{
+            "触发": "✅ 两融出清确认(杠杆快速出清+V型反弹确认)"})
+    if cooldown:
+        return 0.0, dict(detail_base, **{
+            "触发": "冷却期内(60自然日内已触发过)"})
+
+    missing = []
+    if not bool((dd_from_high < -0.10).fillna(False).iloc[-1]):
+        missing.append(f"两融未出清({float(dd_from_high.iloc[-1]):.1%}>-10%)")
+    if not bool(above_ma20.iloc[-1]):
+        missing.append("未站回MA20")
+    if 'volume' in d.columns and not bool(vol_recovering.iloc[-1]):
+        missing.append("量能未回升")
+    return 0.0, dict(detail_base, **{
+        "触发": "未触发", "缺条件": "; ".join(missing)})
 
 
 # ═══════════════════════════════════════════

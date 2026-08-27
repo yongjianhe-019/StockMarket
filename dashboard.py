@@ -32,16 +32,32 @@ if __name__ == "__main__":
         a_data = fetch_all_data(force=False)
         macro_df = fetch_all_macro(force=False)
 
-        # 补全 CSI2000
+        # 补全 CSI2000（近期段缺失时用 ETF 159531 反推指数）
+        # ratio = ETF价格/指数点位（重叠日实测）；反推指数 = ETF价格 / ratio（2026-08-28 修复: 曾误用 *ratio 产生4700倍断层）
         idx2000 = a_data['csi2000_daily'].copy()
         etf531 = a_data['etf_159531'].copy()
         nd = etf531[~etf531['date'].isin(idx2000['date'])]
-        if not nd.empty:
+        ratio_2000 = None
+        if len(nd) > 0:
             ol = idx2000.merge(etf531[['date','close']].rename(columns={'close':'e'}), on='date', how='inner')
-            ratio = (ol['e']/ol['close']).mean() if not ol.empty else 500
-            nr = pd.DataFrame({'date':nd['date'],'open':nd['open']*ratio,'close':nd['close']*ratio,
-                               'high':nd['high']*ratio,'low':nd['low']*ratio,'volume':nd['volume']})
+            if ol.empty:
+                raise ValueError("CSI2000拼接: 与ETF无重叠日，无法计算换算比率")
+            ol = ol.assign(day_ratio=ol['e']/ol['close']).sort_values('date')
+            # 断言1: 相邻日换算比率变化应平稳（ETF折溢价漂移，日变化通常<1%；
+            # 全期CV含趋势漂移不适用，故用相邻日变化std）
+            day_ratio_chg = ol['day_ratio'].pct_change().dropna()
+            if day_ratio_chg.std() > 0.02:
+                raise ValueError(f"CSI2000拼接: 换算比率日变化异常 (std={day_ratio_chg.std():.2%})")
+            # ratio 取最近10个重叠日均值（贴近补丁段，实测反推误差<0.3%）
+            ratio_2000 = float(ol['day_ratio'].tail(10).mean())
+            nr = pd.DataFrame({'date':nd['date'],'open':nd['open']/ratio_2000,'close':nd['close']/ratio_2000,
+                               'high':nd['high']/ratio_2000,'low':nd['low']/ratio_2000,'volume':nd['volume']})
             a_data['csi2000_daily'] = pd.concat([idx2000,nr]).sort_values('date').reset_index(drop=True)
+            # 断言2: 拼接点无跳变（换算正确时相邻两日对数收益应远小于50%）
+            jc = a_data['csi2000_daily']['close']
+            jump = float(abs(np.log(jc.iloc[len(idx2000)] / jc.iloc[len(idx2000)-1])))
+            if jump > 0.5:
+                raise ValueError(f"CSI2000拼接: 拼接点跳变 {jump:.0%}，换算比率疑似错误")
 
         # ═══════════════════════════════════
         # 当前信号
@@ -57,6 +73,12 @@ if __name__ == "__main__":
         pe_pct = signal.get('pe_pct_300')
         pe_str = f"{pe_pct:.0%}" if pe_pct is not None else "N/A"
         print(f"  PE分位: {pe_str}  {'🟢 便宜' if pe_pct and pe_pct < 0.3 else '🟡 合理' if pe_pct and pe_pct < 0.6 else '🔴 偏贵' if pe_pct else ''}")
+        # v6 加分维度状态（两融出清确认）——冰点分数分项
+        fl_2000 = signal.get('details_2000', {}).get('两融出清确认(+13)', {})
+        if fl_2000:
+            trig = fl_2000.get('触发', '')
+            dd = fl_2000.get('两融距6月高', '')
+            print(f"  [2000加分] 两融出清确认: {trig}" + (f" (两融{dd})" if dd else ""))
 
         if signal['ice_300'] or signal['ice_2000']:
             targets = []
@@ -75,7 +97,9 @@ if __name__ == "__main__":
                     for r in leg['reasons'][:3]:
                         print(f"     - {r}")
                 elif leg.get('recovery'):
-                    print(f"  ↩️ {name}: {leg['level']} → 回补窗口")
+                    # v6 回补阶梯: 档位/累计回补比例（档1=1/3 → 档2=2/3 → 档3=3/3）
+                    pct = leg.get('recovery_pct', 0)
+                    print(f"  ↩️ {name}: {leg['level']} → 回补（累计{pct:.0%}，分批买回）")
                 else:
                     print(f"  ✅ {name}: 无卖出信号（{leg['level']}）")
         elif signal['bubble']:
@@ -116,7 +140,8 @@ if __name__ == "__main__":
             idx2 = a_data['csi2000_daily']
             p2 = float(etf531[etf531['date']<=dt]['close'].tail(1).iloc[0]) if len(etf531[etf531['date']<=dt])>0 else None
             if p2 is None and len(idx2[idx2['date']<=dt])>0:
-                p2 = float(idx2[idx2['date']<=dt]['close'].iloc[-1]) * r300 * 0.8  # 近似
+                # ETF未上市前用指数×实测换算比率近似（ratio_2000=ETF/指数；r300*0.8为旧兜底近似）
+                p2 = float(idx2[idx2['date']<=dt]['close'].iloc[-1]) * (ratio_2000 or r300*0.8)
 
             if ice['csi300'] or ice['csi2000']:
                 ice_points.append({

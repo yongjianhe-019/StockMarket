@@ -87,10 +87,21 @@ def is_bubble(macro_df: pd.DataFrame, csi300_val=None, csi2000_val=None,
     return result
 
 
+def _recovery_label(level: int, pct: float) -> str:
+    """回补档位文案。"""
+    if level == 1:
+        return "回站MA20且量能回升(回补档1)"
+    if level == 2:
+        return "回站MA60(回补档2)"
+    return "回站MA60且MA60拐头向上(回补档3)"
+
+
 def _compute_leg(hist: pd.DataFrame, date, pe_pct, signals_c: list,
                  daily: pd.DataFrame) -> dict:
     """按单个标的日线计算卖出/回补信号（PE门槛为全市场背景条件）。"""
-    recovery = _check_trend_recovery(daily, date) if daily is not None else False
+    # v6: 回补阶梯化——档位计算提前，PE<60% 早退分支同样输出 level/pct
+    recovery_level, recovery_pct = _check_recovery_level(daily, date) if daily is not None else (0, 0.0)
+    recovery = recovery_level >= 1
 
     # ═══════════════════════════════════════
     # 前提：PE 必须贵 (>60% 分位) —— 全市场背景
@@ -99,12 +110,14 @@ def _compute_leg(hist: pd.DataFrame, date, pe_pct, signals_c: list,
         return {
             "is_bubble": False,
             "signal_type": "trend_recovery" if recovery else None,
-            "level": "趋势修复·回补" if recovery else "PE合理",
+            "level": f"趋势修复·回补·档{recovery_level}" if recovery else "PE合理",
             "sell_pct": 0.0,
-            "reasons": ["回站MA60且MA60拐头向上(趋势修复)"] if recovery else [],
+            "reasons": [_recovery_label(recovery_level, recovery_pct)] if recovery else [],
             "signals": {},
             "pe_pct": pe_pct,
             "recovery": recovery,
+            "recovery_level": recovery_level,
+            "recovery_pct": recovery_pct,
         }
 
     # ═══════════════════════════════════════
@@ -163,6 +176,8 @@ def _compute_leg(hist: pd.DataFrame, date, pe_pct, signals_c: list,
             }),
             "pe_pct": pe_pct,
             "recovery": False,
+            "recovery_level": 0,
+            "recovery_pct": 0.0,
         }
 
     if categories_triggered >= 2:
@@ -185,23 +200,29 @@ def _compute_leg(hist: pd.DataFrame, date, pe_pct, signals_c: list,
             }),
             "pe_pct": pe_pct,
             "recovery": False,
+            "recovery_level": 0,
+            "recovery_pct": 0.0,
         }
 
     if recovery:
-        # 回补规则（v5 新增）：趋势破坏减仓后，趋势修复 → 恢复仓位
+        # 回补规则（v5 新增，v6 阶梯化）：趋势破坏减仓后，趋势修复 → 恢复仓位
+        # recovery_pct 为累计回补比例（档1=1/3 → 档2=2/3 → 档3=3/3）
         return {
             "is_bubble": False,
             "signal_type": "trend_recovery",
-            "level": "趋势修复·回补",
+            "level": f"趋势修复·回补·档{recovery_level}",
             "sell_pct": 0.0,
-            "reasons": ["回站MA60且MA60拐头向上(趋势修复)"],
+            "reasons": [_recovery_label(recovery_level, recovery_pct),
+                        f"累计回补{recovery_pct:.0%}"],
             "signals": dict(signal_pack, **{
-                "趋势修复": ["回站MA60且MA60拐头向上"],
+                "趋势修复": [f"回补档{recovery_level}·累计回补{recovery_pct:.0%}"],
                 "触发类别数": categories_triggered,
                 "总信号数": total_count,
             }),
             "pe_pct": pe_pct,
             "recovery": True,
+            "recovery_level": recovery_level,
+            "recovery_pct": recovery_pct,
         }
 
     return {
@@ -213,6 +234,8 @@ def _compute_leg(hist: pd.DataFrame, date, pe_pct, signals_c: list,
         "signals": signal_pack,
         "pe_pct": pe_pct,
         "recovery": False,
+        "recovery_level": 0,
+        "recovery_pct": 0.0,
     }
 
 
@@ -443,32 +466,68 @@ def _check_trend_breakdown(daily: pd.DataFrame, date) -> bool:
     return current < ma60_now and ma60_now < ma60_prev
 
 
-def _check_trend_recovery(daily: pd.DataFrame, date, lookback: int = 250) -> bool:
+def _check_recovery_level(daily: pd.DataFrame, date,
+                          lookback: int = 250) -> tuple[int, float]:
     """
-    趋势修复检测（v5 新增 — 回补规则）: 收盘价回站 MA60 且 MA60 拐头向上，
-    且近 lookback 个交易日内出现过趋势破坏（否则只是普通上涨，不叫"回补"）。
+    趋势修复分档检测（v6 回补阶梯化，2026-08-28）: 返回 (level, recovery_pct)。
+
+    三档按自然时序分层（V 型中档1/2 数日内触发、档3 晚 3~4 周，拉开回补节奏，
+    解决 v5 单档"站回MA60且拐头"门槛≈1.54 的右侧追高问题）:
+      level 1: 近 lookback 日有趋势破坏（闩锁）+ 收盘>MA20 且 5日均量>20日均量 → 1/3
+      level 2: 收盘 > MA60 → 2/3
+      level 3: 收盘 > MA60 且 MA60 拐头向上（v5 完全条件）→ 3/3
+    每档判定要求连续 2 个交易日满足（减鞭打）。
     """
     if daily is None or daily.empty:
-        return False
+        return 0, 0.0
 
     d = daily[daily['date'] <= date]
     if len(d) < 80:
-        return False
+        return 0, 0.0
 
     close = d['close']
+    ma20 = close.rolling(20).mean()
     ma60 = close.rolling(60).mean()
     ma60_prev = ma60.shift(20)
-    current = float(close.iloc[-1])
-    ma60_now = float(ma60.iloc[-1])
-    ma60_past = float(ma60_prev.iloc[-1])
 
-    # 回站 MA60 且 MA60 拐头向上
-    if not (current > ma60_now and ma60_now > ma60_past):
-        return False
-
-    # 近 lookback 个交易日内曾出现趋势破坏
+    # 闩锁: 近 lookback 个交易日内曾出现趋势破坏（否则只是普通上涨，不叫"回补"）
     breakdown = (close < ma60) & (ma60 < ma60_prev)
-    return bool(breakdown.tail(lookback).any())
+    has_breakdown = bool(breakdown.tail(lookback).any())
+
+    above_ma20 = (close > ma20).fillna(False)
+    above_ma60 = (close > ma60).fillna(False)
+    ma60_turning = (ma60 > ma60_prev).fillna(False)
+    vol_ok = pd.Series(True, index=close.index)
+    if 'volume' in d.columns:
+        vol_ok = (d['volume'].rolling(5).mean()
+                  > d['volume'].rolling(20).mean()).fillna(False)
+
+    # 连续2个交易日满足（减鞭打）
+    c1 = (above_ma20 & vol_ok)
+    c2 = above_ma60
+    c3 = (above_ma60 & ma60_turning)
+    lvl1 = (c1 & c1.shift(1)).fillna(False)
+    lvl2 = (c2 & c2.shift(1)).fillna(False)
+    lvl3 = (c3 & c3.shift(1)).fillna(False)
+
+    if not has_breakdown:
+        return 0, 0.0
+    if bool(lvl3.iloc[-1]):
+        return 3, 1.0
+    if bool(lvl2.iloc[-1]):
+        return 2, 2 / 3
+    if bool(lvl1.iloc[-1]):
+        return 1, 1 / 3
+    return 0, 0.0
+
+
+def _check_trend_recovery(daily: pd.DataFrame, date, lookback: int = 250) -> bool:
+    """
+    趋势修复检测（v5 兼容包装器 — 回补规则）: 档位≥1 即 True。
+    旧语义: 收盘价回站 MA60 且 MA60 拐头向上 + 近 lookback 日内有趋势破坏。
+    """
+    level, _ = _check_recovery_level(daily, date, lookback)
+    return level >= 1
 
 
 def _pe_percentile(val_df, date):

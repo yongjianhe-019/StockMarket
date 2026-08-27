@@ -25,7 +25,9 @@ warnings.filterwarnings('ignore')
 DATA = '/Users/hyj/PycharmProjects/StockMarket/data'
 
 mb = pd.read_parquet(f'{DATA}/margin_balance.parquet').sort_values('date').reset_index(drop=True)
-idx = pd.read_parquet(f'{DATA}/csi2000_daily_full.parquet').sort_values('date').reset_index(drop=True)
+# 生产序列（index 全量到 2026-08-27）。注: 曾用 csi2000_daily_full.parquet（ETF反推），
+# 与生产 index 序列在 2026-08 结论相反（8/4 full触发 vs index 8/7触发）——验收必须以生产序列为准
+idx = pd.read_parquet(f'{DATA}/csi2000_daily.parquet').sort_values('date').reset_index(drop=True)
 idx300 = pd.read_parquet(f'{DATA}/csi300_daily.parquet').sort_values('date').reset_index(drop=True)
 
 mb['date'] = pd.to_datetime(mb['date'])
