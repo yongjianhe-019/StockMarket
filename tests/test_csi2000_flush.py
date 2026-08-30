@@ -57,7 +57,7 @@ def _macro_from_local_files() -> pd.DataFrame:
             df[c] = m[c].values
 
     add(fx[["date", "usd_cny", "jpy_cny"]], ["usd_cny", "jpy_cny"])
-    add(spread[["date", "spread_10y"]], ["spread_10y"])
+    add(spread[["date", "cn_2y", "us_2y", "spread_10y"]], ["cn_2y", "us_2y", "spread_10y"])
     add(gold[["date", "gold_price"]], ["gold_price"])
     add(china[["date", "social_finance", "m2_yoy"]], ["social_finance", "m2_yoy"])
     add(fed[["date", "fed_rate"]], ["fed_rate"])
@@ -174,6 +174,45 @@ class TestFlushGuards(unittest.TestCase):
         s, detail = _score_margin_flush(idx2000, macro, pd.Timestamp("2026-08-07"))
         self.assertEqual(s, 0.0)
         self.assertIn("无两融", detail["状态"])
+
+
+class TestRatePercentile(unittest.TestCase):
+    """利率分位维度（2026-08-30 宏观重构新增）。"""
+
+    def test_low_percentile_full_score(self):
+        """利率处 5 年低位（分位<0.20）→ 满分 10。"""
+        from models.csi2000 import _score_rate_percentile
+        # 递减序列：当前值在 1260 个历史值中最低 → 分位≈0
+        s = pd.Series(np.linspace(3.5, 1.0, 1260))
+        score, pct = _score_rate_percentile(s, 10)
+        self.assertEqual(score, 10)
+        self.assertLess(pct, 0.20)
+
+    def test_high_percentile_zero(self):
+        """利率处 5 年高位（分位>0.80）→ 0 分。"""
+        from models.csi2000 import _score_rate_percentile
+        s = pd.Series(np.linspace(1.0, 3.5, 1260))
+        score, pct = _score_rate_percentile(s, 10)
+        self.assertEqual(score, 0)
+        self.assertGreaterEqual(pct, 0.80)
+
+    def test_insufficient_data_zero(self):
+        """数据不足（<756 观测）→ 0 分，不崩溃。"""
+        from models.csi2000 import _score_rate_percentile
+        s = pd.Series(np.linspace(3.0, 1.5, 100))
+        score, pct = _score_rate_percentile(s, 10)
+        self.assertEqual(score, 0)
+        self.assertIsNone(pct)
+
+    def test_macro_liquidity_refactored_components(self):
+        """重构后宏观流动性含中国利率+全球流动性分项，总分 35 封顶。"""
+        from models.csi2000 import _score_macro_liquidity
+        # 生产列齐备的宏观点：2026-08（cn_2y 低位满分、us_2y 高位低分）
+        macro = _macro_from_local_files()
+        s, d = _score_macro_liquidity(macro, pd.Timestamp("2026-08-25"))
+        self.assertLessEqual(s, 35)
+        self.assertIn("中国利率", d)
+        self.assertIn("全球流动性", d)
 
 
 if __name__ == "__main__":

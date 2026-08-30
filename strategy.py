@@ -14,7 +14,7 @@ import pandas as pd
 import numpy as np
 
 from models.csi300 import compute_csi300_score
-from models.csi2000 import compute_csi2000_score
+from models.csi2000 import compute_csi2000_score, csi2000_buy_channel
 from macro.sell_signal import is_bubble
 
 
@@ -22,14 +22,22 @@ from macro.sell_signal import is_bubble
 # 冰点检测
 # ═══════════════════════════════════
 
-def detect_ice_point(data: dict, macro_df: pd.DataFrame, date) -> dict:
+def detect_ice_point(data: dict, macro_df: pd.DataFrame, date,
+                     score_history_2000: list = None) -> dict:
     """
     检测冰点买入信号。
 
     CSI300: 估值驱动模型，分数≥50 → 冰点
-    CSI2000: 流动性+动量模型，分数≥50 → 冰点
+    CSI2000: 流动性+动量模型 + v7 三通道（动态阈值）
+      - 通道A 冰点: 绝对分≥50 或 5年分数分位≤15%，回撤>10%
+      - 通道B 超跌企稳: r20 5年分位≤10% + 站回MA10，回撤>15%
+      - 通道C 次冰点: 分数40~49 + 回撤>10%
 
-    Returns {csi300: bool, csi2000: bool, details: ...}
+    score_history_2000: [(date, score), ...] 月度分数历史（回测每轮
+    append 复用，避免通道A 分数分位重复打分；单点调用可省略）。
+
+    Returns {csi300: bool, csi2000: bool, details: ...,
+             channel_2000: 'A'|'B'|'C'|None, position_pct_2000: float}
     """
     idx300 = data['csi300_daily']
     idx2000 = data['csi2000_daily']
@@ -53,7 +61,17 @@ def detect_ice_point(data: dict, macro_df: pd.DataFrame, date) -> dict:
     )
 
     ice_300 = s300['total_score'] >= 50
-    ice_2000 = s2000['total_score'] >= 50
+
+    # CSI2000 v7 三通道（动态阈值）：通道非空 = 冰点
+    ch2000 = csi2000_buy_channel(
+        daily=idx2000[idx2000['date'] <= date],
+        csi300_daily=idx300[idx300['date'] <= date],
+        macro=macro_df[macro_df['date'] <= date] if macro_df is not None else None,
+        latest_date=date,
+        current_score=s2000['total_score'],
+        score_history=score_history_2000,
+    )
+    ice_2000 = ch2000['channel'] is not None
 
     # PE 分位
     pe_pct_300 = _get_pe_pct(val300, date) if val300 is not None else None
@@ -66,6 +84,10 @@ def detect_ice_point(data: dict, macro_df: pd.DataFrame, date) -> dict:
         'pe_pct_300': pe_pct_300,
         'details_300': s300.get('details', {}),
         'details_2000': s2000.get('details', {}),
+        # v7 三通道扩展字段
+        'channel_2000': ch2000['channel'],
+        'position_pct_2000': ch2000['position_pct'],
+        'channel_detail_2000': ch2000.get('detail', {}),
     }
 
 

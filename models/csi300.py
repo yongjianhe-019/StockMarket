@@ -300,8 +300,8 @@ def compute_csi300_score(daily: pd.DataFrame,
         if not m.empty:
             confirmations = []
             # PMI 不再恶化（连续2月不创新低）
-            if "pmi" in m.columns:
-                pmi_data = m["pmi"].dropna()
+            if "pmi_manufacturing" in m.columns:
+                pmi_data = m["pmi_manufacturing"].dropna()
                 if len(pmi_data) >= 3:
                     pmi_now = pmi_data.iloc[-1]
                     pmi_1m = pmi_data.iloc[-2]

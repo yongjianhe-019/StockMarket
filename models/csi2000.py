@@ -54,7 +54,7 @@ def compute_csi2000_score(daily: pd.DataFrame,
     # ═══════════════════════════════════════
     s_macro, d_macro = 0.0, {}
     if macro is not None and not macro.empty:
-        s_macro, d_macro = _score_macro_liquidity(macro)
+        s_macro, d_macro = _score_macro_liquidity(macro, latest_date)
 
     # ═══════════════════════════════════════
     # 2. 趋势动量 (30分)
@@ -79,8 +79,8 @@ def compute_csi2000_score(daily: pd.DataFrame,
         m = macro[macro["date"] <= latest_date]
         if not m.empty:
             confirmations = []
-            if "pmi" in m.columns:
-                pmi_data = m["pmi"].dropna()
+            if "pmi_manufacturing" in m.columns:
+                pmi_data = m["pmi_manufacturing"].dropna()
                 if len(pmi_data) >= 3:
                     pmi_now = pmi_data.iloc[-1]
                     pmi_1m = pmi_data.iloc[-2]
@@ -166,54 +166,131 @@ def compute_csi2000_score(daily: pd.DataFrame,
 # 维度 1: 宏观流动性 (35分)
 # ═══════════════════════════════════════════
 
-def _score_macro_liquidity(macro: pd.DataFrame) -> tuple[float, dict]:
-    """M2 + 社融 + 利差 = 流动性环境。"""
-    scores = {}
+def _score_rate_percentile(series: pd.Series, max_score: float,
+                           lookback: int = 1260, min_periods: int = 756) -> tuple[float, float | None]:
+    """利率水平 5 年滚动分位打分：低分位(利率低=货币宽松)加分。
 
-    # M2增速：>10%强烈利好小盘, >8%利好, <6%利空
-    if "m2_yoy" in macro.columns:
-        m2 = macro["m2_yoy"].dropna().iloc[-1]
-        m2_chg = macro["m2_yoy"].dropna().diff(3).iloc[-1] if len(macro["m2_yoy"].dropna()) > 3 else 0
-        if m2 > 12:     s = 15
-        elif m2 > 10:   s = 12
-        elif m2 > 8:    s = 8
-        elif m2 > 6:    s = 4
-        else:           s = 0
-        if m2_chg > 0.5: s = min(s + 2, 15)
-        scores["M2"] = f"{m2:.1f}% → {s}分"
+    绝对阈值会时代漂移（cn_2y 从 2015 年 3.4% 降到 2026 年 1.25%），
+    必须用相对自身历史的分位。返回 (分数, 当前分位)。
+    """
+    s = pd.Series(series).dropna()
+    if len(s) < min_periods:
+        return 0.0, None
+    cur = float(s.iloc[-1])
+    pct = float((s.tail(lookback) < cur).mean())
+    if pct < 0.20:      return max_score, pct
+    elif pct < 0.40:    return round(max_score * 0.7), pct
+    elif pct < 0.60:    return round(max_score * 0.4), pct
+    elif pct < 0.80:    return round(max_score * 0.2), pct
+    else:               return 0.0, pct
+
+
+def _score_macro_liquidity(macro: pd.DataFrame,
+                           latest_date=None) -> tuple[float, dict]:
+    """流动性环境 = M2 + 社融 + 中国利率 + 全球流动性（35分）。
+
+    2026-08-30 重构（数据接入，研究依据 /tmp/study_unused_fields.py）:
+    - 原结构 M2(15)+社融(10)+中美利差(10)：24 列里利率水平/全球利率从未用上
+    - 新结构 M2(10)+社融(8)+中国利率 cn_2y(10)+全球流动性 us_2y(7)
+    - 滚动分位 IC 验证: cn_2y=-0.46、us_2y=-0.40 全样本显著（利率低→小盘未来涨）
+    - 利率维度必须用 5 年滚动分位（绝对阈值随时代漂移失效）
+    - cn_2y/us_2y 缺失时回退旧逻辑（兼容旧数据/测试 fixture）
+    - 不接入: cpi/gold/retail/house_price/jpy_cny(IC<0.10 无效)、usd_cny(0.18
+      边缘且与利差相关)、m1_yoy(与 M2 相关)、fed_rate(停更2025-07，由 us_2y 代表)
+    """
+    scores = {}
+    total = 0.0
+    m = macro
+    if latest_date is not None:
+        latest_date = pd.Timestamp(latest_date)
+        m = macro[macro["date"] <= latest_date]
+        if m.empty:
+            return 0.0, {"状态": "信号日无宏观数据"}
+
+    # ── M2 增速 (10分)：绝对阈值，货币总量 ──
+    if "m2_yoy" in m.columns:
+        m2 = m["m2_yoy"].dropna()
+        if len(m2) >= 1:
+            m2_now = float(m2.iloc[-1])
+            m2_chg = float(m2.diff(3).iloc[-1]) if len(m2) > 3 else 0
+            if m2_now > 12:     s_m2 = 10
+            elif m2_now > 10:   s_m2 = 8
+            elif m2_now > 8:    s_m2 = 6
+            elif m2_now > 6:    s_m2 = 3
+            else:               s_m2 = 1
+            if m2_chg > 0.5:
+                s_m2 = min(s_m2 + 1, 10)
+            scores["M2"] = f"{m2_now:.1f}% → {s_m2}分"
+            total += s_m2
+        else:
+            scores["M2"] = "无数据"
     else:
-        s = 0
         scores["M2"] = "无数据"
 
-    # 信用环境：社融扩张
-    if "social_finance" in macro.columns:
-        sf = macro["social_finance"].dropna()
+    # ── 社融 (8分)：信用扩张 ──
+    if "social_finance" in m.columns:
+        sf = m["social_finance"].dropna()
         if len(sf) >= 12:
-            recent = sf.iloc[-6:].mean()
-            prior = sf.iloc[-12:-6].mean()
+            recent = float(sf.iloc[-6:].mean())
+            prior = float(sf.iloc[-12:-6].mean())
             sf_ratio = recent / prior if prior > 0 else 1
-            if sf_ratio > 1.2:      s_sf = 10
-            elif sf_ratio > 1.05:   s_sf = 7
-            elif sf_ratio > 0.95:   s_sf = 4
+            if sf_ratio > 1.2:      s_sf = 8
+            elif sf_ratio > 1.05:   s_sf = 6
+            elif sf_ratio > 0.95:   s_sf = 3
             else:                   s_sf = 0
+            scores["信用"] = f"社融近6/前6月={sf_ratio:.2f} → {s_sf}分"
+            total += s_sf
         else:
-            s_sf = 4
+            scores["信用"] = "数据不足"
+            total += 3  # 中性兜底
     else:
-        s_sf = 0
-    scores["信用"] = f"社融近6/前6月={sf_ratio:.2f} → {s_sf}分" if 'sf_ratio' in dir() else "无数据"
+        scores["信用"] = "无数据"
 
-    # 中美利差：倒挂程度
-    if "spread_10y" in macro.columns:
-        sp = macro["spread_10y"].dropna().iloc[-1]
+    # ── 中国利率环境 (10分)：cn_2y 5年滚动分位（低利率=宽松）──
+    if "cn_2y" in m.columns:
+        s_cn, p_cn = _score_rate_percentile(m["cn_2y"], 10)
+        if p_cn is not None:
+            scores["中国利率"] = f"cn_2y分位={p_cn:.0%} → {s_cn}分"
+            total += s_cn
+        else:
+            scores["中国利率"] = "数据不足"
+    elif "spread_10y" in m.columns:
+        # 回退：原中美利差逻辑（兼容缺 cn_2y 的旧数据）
+        sp = float(m["spread_10y"].dropna().iloc[-1])
         if sp > -1.5:       s_sp = 10
         elif sp > -2.5:     s_sp = 6
         elif sp > -3.5:     s_sp = 3
         else:               s_sp = 0
+        scores["利差"] = f"{sp:.1f}% → {s_sp}分"
+        total += s_sp
     else:
-        s_sp = 0
-    scores["利差"] = f"{sp:.1f}% → {s_sp}分" if 'sp' in dir() else "无数据"
+        scores["中国利率"] = "无数据"
 
-    total = s + (s_sf if 's_sf' in dir() else 4) + (s_sp if 's_sp' in dir() else 5)
+    # ── 全球流动性 (7分)：us_2y 5年滚动分位（低=全球宽松）──
+    if "us_2y" in m.columns:
+        s_us, p_us = _score_rate_percentile(m["us_2y"], 7)
+        if p_us is not None:
+            scores["全球流动性"] = f"us_2y分位={p_us:.0%} → {s_us}分"
+            total += s_us
+        else:
+            scores["全球流动性"] = "数据不足"
+    elif "fed_rate" in m.columns:
+        # 回退：fed 降息周期
+        fr = m["fed_rate"].dropna()
+        if len(fr) >= 1:
+            fr_now = float(fr.iloc[-1])
+            fr_1y = float(fr.iloc[-max(2, min(len(fr), 13))]) if len(fr) > 2 else fr_now
+            if fr_now < fr_1y:      s_fr = 7
+            elif fr_now < 2.5:      s_fr = 5
+            elif fr_now < 4:        s_fr = 3
+            else:                   s_fr = 1
+            scores["全球流动性"] = f"fed {fr_now:.1f}% → {s_fr}分"
+            total += s_fr
+        else:
+            scores["全球流动性"] = "无数据"
+    else:
+        scores["全球流动性"] = "无数据"
+
     scores["总分"] = total
     return total, scores
 
@@ -446,6 +523,179 @@ def _score_margin_flush(daily: pd.DataFrame, macro: pd.DataFrame,
         missing.append("量能未回升")
     return 0.0, dict(detail_base, **{
         "触发": "未触发", "缺条件": "; ".join(missing)})
+
+
+# ═══════════════════════════════════════════
+# v7: 三通道买入信号（动态阈值）
+# ═══════════════════════════════════════════
+
+def _rolling_percentile(series: pd.Series, window: int) -> pd.Series:
+    """滚动分位（0~1，当前值在窗口内的严格排名），窗口不足返回 NaN。"""
+    return series.rolling(window=window).apply(
+        lambda x: (x < x[-1]).sum() / len(x), raw=True
+    )
+
+
+def _monthly_score_history(daily: pd.DataFrame, csi300_daily: pd.DataFrame,
+                           macro: pd.DataFrame, latest_date, n_months: int = 60) -> list:
+    """生成截至 latest_date 的月度分数历史（每月最后交易日打分）。
+
+    用于分数分位视图（通道A）：score 是绝对分，其 5 年滚动分位随市场
+    水位变化——熊市里 40 分可能是历史低分位，牛市里 40 分可能是高分位。
+    调用方（回测）可传 score_history 复用已算分数，避免重复打分。
+    """
+    daily = daily[daily['date'] <= latest_date].sort_values('date')
+    hist = []
+    month_ends = daily.groupby(daily['date'].dt.to_period('M'))['date'].max().tail(n_months)
+    for d in month_ends:
+        d = pd.Timestamp(d)
+        res = compute_csi2000_score(
+            daily=daily[daily['date'] <= d],
+            valuation=None,
+            csi300_daily=csi300_daily[csi300_daily['date'] <= d],
+            macro=macro[macro['date'] <= d] if macro is not None else None,
+        )
+        hist.append((d, float(res['total_score'])))
+    return hist
+
+
+def csi2000_buy_channel(daily: pd.DataFrame,
+                        csi300_daily: pd.DataFrame,
+                        macro: pd.DataFrame = None,
+                        latest_date=None,
+                        score_history: list = None,
+                        current_score: float = None) -> dict:
+    """v7 三通道买入信号（动态阈值，2026-08-30）。
+
+    背景：固定阈值 50 分在低波年份（如 2026）永远凑不到冰点，2026 三次
+    下跌全踏空。业界共识（z-score/滚动分位/右侧确认/动态仓位）：
+    "阈值"不能是常数，必须是市场水位（波动率/分位）的函数。
+
+    通道（优先级 A > B；全部要求"站回MA10"企稳确认，防阴跌飞刀）:
+      A 冰点:    (absolute分≥50) 或 (分数5年分位≤15% 且 r20分位≤15% 超跌确认)
+                 + 回撤250日>10%                     → 基础仓位 40%
+                 （分位视图必须叠加超跌：2017-02/12 微盘熊分数低但
+                   r20分位 20%+，是阴跌飞刀；2026-08 大底 r20分位 2%）
+      B 超跌企稳: r20 5年分位≤10%（超跌深度自适应，已验证 5/59 vs 固定 1/59）
+                 + 回撤250日>15%                     → 基础仓位 25%
+
+    动态仓位: 仓位 = 基础 × 按 r20 分位的乘数（只加不减），封顶 50%。
+      r20分位 ≤5% → ×1.4 | ≤10% → ×1.2 | 其余 → ×1.0
+
+    所有阈值都是"过去5年自身历史的分位"——每年随市场水位自动重算，
+    不需要为 2026/2027/2028 逐年调参（结构固定、数值自适应）。
+
+    v7.1/v7.2 修正（2026-08-30 回测诊断，收益下降归因）:
+      ① 初版无企稳过滤：通道A 分数分位视图在阴跌中继触发（2018-06
+         -21.5% 飞刀）→ 全通道统一站回MA10 右侧确认
+      ② 初版动态乘数 >20% 分位 ×0.4：把非超跌月仓位压到 16%（2019-03）
+         低于 v6.1 基线 25% → 收益被摊薄 → 乘数只加不减
+      ③ 回测信号序列从 full 拼接改为 index 生产序列（与实盘同源）
+      ④ 初版通道C(40-49分)在 2016/2017 震荡阴跌市反复触发（-17.9%/
+         -22.8% 飞刀）且抢占90天冷却挤掉优质A买入 → 删除
+      ⑤ 分位视图须叠加 r20≤15% 超跌确认（挡 2017-02/12 微盘熊飞刀，
+         2026-08 大底 r20 分位仅 2% 不受影响）
+
+    score_history: [(month_end_date, score), ...] 由调用方维护（回测每轮
+    append）；为 None 时内部生成 60 个月分数历史。current_score 复用调用
+    方已算好的分数（回测场景省一次全量打分）。
+    """
+    out = {'channel': None, 'position_pct': 0.0, 'score': None,
+           'score_pct': None, 'r20_pct': None, 'dd250': None, 'detail': {}}
+    if daily is None or len(daily) < 250:
+        out['detail'] = {'状态': '数据不足(日线<250行)'}
+        return out
+
+    if latest_date is None:
+        latest_date = daily['date'].max()
+    latest_date = pd.Timestamp(latest_date)
+    d = daily[daily['date'] <= latest_date].sort_values('date').reset_index(drop=True)
+    if len(d) < 250:
+        out['detail'] = {'状态': '数据不足(日线<250行)'}
+        return out
+
+    close = d['close']
+    cur = float(close.iloc[-1])
+
+    # ── 当前分数（复用调用方已算值，避免重复全量打分）──
+    if current_score is not None:
+        score = float(current_score)
+    else:
+        res = compute_csi2000_score(
+            daily=d,
+            valuation=None,
+            csi300_daily=csi300_daily[csi300_daily['date'] <= latest_date],
+            macro=macro[macro['date'] <= latest_date] if macro is not None else None,
+        )
+        score = float(res['total_score'])
+
+    # ── 分数 5 年分位（月度；取最近 60 个月，5年滚动窗口）──
+    if score_history is None:
+        score_history = _monthly_score_history(daily, csi300_daily, macro, latest_date)
+    hist_scores = [s for _, s in score_history][-60:]  # 截断防超窗（回测传全历史）
+    score_pct = None
+    if len(hist_scores) >= 24:
+        score_pct = float((pd.Series(hist_scores) < score).mean())
+
+    # ── r20 5年分位（只需当日值：O(w) 直接排名，避免全列滚动 apply）──
+    r20 = close / close.shift(20) - 1
+    w = min(1260, len(d) - 21)
+    r20_pct = None
+    if w >= 60:
+        r20_pct = float((r20.tail(w) < r20.iloc[-1]).mean())
+
+    # ── 回撤 250 日 ──
+    dd250 = float(close.iloc[-1] / close.rolling(250, min_periods=120).max().iloc[-1] - 1)
+
+    # ── 企稳确认（通道B 右侧，防飞刀）──
+    ma10 = float(close.tail(10).mean())
+    above_ma10 = cur > ma10
+
+    # ── 通道判定（A > B；全部要求企稳确认站回MA10，防阴跌飞刀）──
+    # v7.1 修正（2026-08-30 回测诊断）：
+    #   ① 初版无企稳过滤 → 2018-06 分位视图在阴跌中继触发（-21.5%）
+    #   ② 初版通道C(40-49分)在 2016/2017 震荡阴跌市反复触发并抢占
+    #      90天冷却，挤掉 2016-06/09 优质A买入 → 删除通道C
+    #   ③ 分位视图须叠加 r20≤15% 超跌确认 → 挡 2017-02/12 微盘熊飞刀
+    ch, base = None, 0.0
+    if above_ma10:
+        pct_view = score_pct is not None and score_pct <= 0.15 \
+            and r20_pct is not None and r20_pct <= 0.15
+        if score >= 50 or pct_view:
+            if dd250 < -0.10:
+                ch, base = 'A', 0.40
+        if ch is None and r20_pct is not None and r20_pct <= 0.10 and dd250 < -0.15:
+            ch, base = 'B', 0.25
+
+    # ── 动态仓位（只加不减：超跌越深买越多，不超跌维持基础仓位）──
+    # v7.1 修正：初版 >20% 分位 ×0.4 把 2019-03 等非超跌月摊薄到 16%，
+    # 低于 v6.1 的 25% 基线 → 收益被摊薄。改为只奖励超跌，不惩罚。
+    mult = 1.0
+    if r20_pct is not None:
+        if r20_pct <= 0.05:      mult = 1.4
+        elif r20_pct <= 0.10:    mult = 1.2
+    pct = min(0.50, base * mult) if ch else 0.0
+
+    out.update({
+        'channel': ch,
+        'position_pct': round(pct, 4),
+        'score': score,
+        'score_pct': score_pct,
+        'r20_pct': r20_pct,
+        'dd250': dd250,
+        'detail': {
+            '通道': ch or '无',
+            '分数': f"{score:.1f}",
+            '分数分位': f"{score_pct:.0%}" if score_pct is not None else 'N/A',
+            'r20分位': f"{r20_pct:.0%}" if r20_pct is not None else 'N/A',
+            '回撤250日': f"{dd250:.1%}",
+            '站回MA10': '✅' if above_ma10 else '❌',
+            '基础仓位': f"{base:.0%}" if ch else '—',
+            '动态乘数': f"×{mult:.1f}" if ch else '—',
+            '买入仓位': f"{pct:.0%}" if ch else '—',
+        },
+    })
+    return out
 
 
 # ═══════════════════════════════════════════

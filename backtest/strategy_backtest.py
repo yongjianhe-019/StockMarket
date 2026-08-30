@@ -2,9 +2,13 @@
 策略回测：冰点买入 + 泡沫卖出（使用项目实际量化模型）
 
 - CSI300: 估值驱动冰点模型（score≥50 → 买入）
-- CSI2000: 流动性+动量冰点模型（score≥50 → 买入）
+- CSI2000: 流动性+动量冰点模型 + v7 三通道（动态阈值）
+  - 通道A 冰点: 绝对分≥50 或 5年分数分位≤15%，回撤>10% → 仓位 40%
+  - 通道B 超跌企稳: r20 5年分位≤10% + 站回MA10，回撤>15% → 仓位 25%
+  - 通道C 次冰点: 分数40~49 + 回撤>10% → 仓位 15%
+  - 动态仓位: 基础仓位 × r20分位乘数（≤5%→1.3 | ≤10%→1.0 | ≤20%→0.7 | 其余→0.4），封顶50%
 - 泡沫检测: PE>60%分位 + 三分类确认 ≥2类 → 卖出
-- 月频信号，每次冰点最多用25%现金买入
+- 月频信号；CSI300 每次最多25%现金买入
 - 使用指数点位追踪，不影响相对收益率
 """
 import json
@@ -35,14 +39,12 @@ macro = fetch_all_macro(force=True)
 idx300 = a['csi300_daily'].copy()
 print(f"CSI300 指数: {len(idx300)}行, {idx300['date'].min().date()} ~ {idx300['date'].max().date()}")
 
-# CSI2000: 用 full 文件（csindex + ETF 反推合成）
-full_path = Path('/Users/hyj/PycharmProjects/StockMarket/data/csi2000_daily_full.parquet')
-if full_path.exists():
-    idx2000 = pd.read_parquet(full_path)
-    print(f"CSI2000 full: {len(idx2000)}行, {idx2000['date'].min().date()} ~ {idx2000['date'].max().date()}")
-else:
-    idx2000 = a['csi2000_daily'].copy()
-    print(f"CSI2000: {len(idx2000)}行, {idx2000['date'].min().date()} ~ {idx2000['date'].max().date()}")
+# CSI2000: 统一用 index 生产序列（与 dashboard 实盘一致；full 拼接序列
+# 又短又旧且 2026 点位差 4.3%，信号必须与生产同源）
+idx2000 = a['csi2000_daily'].copy()
+idx2000['date'] = pd.to_datetime(idx2000['date'])
+idx2000 = idx2000.sort_values('date').reset_index(drop=True)
+print(f"CSI2000 index 生产序列: {len(idx2000)}行, {idx2000['date'].min().date()} ~ {idx2000['date'].max().date()}")
 
 # ETF 用于价格换算（指数点到实际交易价格）
 # ETF 净值 ≈ 指数点位 / 1000（粗略），精确比例从缓存计算
@@ -57,11 +59,14 @@ print(f"CSI300 价格因子 (ETF/Index): {r300:.6f}")
 # CSI2000 价格：直接用指数点位的 1/1000 作为参考价
 r2000 = 1/1000
 
-# --- 3. 逐月回测 ---
-start_date = pd.Timestamp('2015-01-01')
-end_date = pd.Timestamp('2026-08-01')
+# --- 3. 逐日回测（v7.2: 月扫改日扫——V型急跌底在月扫时点（月初）
+#       早于确认日（如2026-08-07 V底），月扫是结构性盲区）---
+# 评估窗口：近 3 年（用户 2026-08-30 指示：历史太远无参考价值，
+# A股市场结构已变，核心关注 2026）；可用命令行参数覆盖起点
+start_date = pd.Timestamp(sys.argv[1] if len(sys.argv) > 1 else '2023-08-01')
+end_date = pd.Timestamp('2026-08-28')
 
-months = pd.date_range(start_date, end_date, freq='MS')
+days = idx2000[(idx2000['date'] >= start_date) & (idx2000['date'] <= end_date)]['date']
 
 cash = 100000.0
 # 持仓用 "指数单位" 追踪：1单位 = 买入时按指数换算
@@ -76,15 +81,24 @@ last_buy_300 = None
 last_buy_2000 = None
 cooldown_days = 90  # 同一标的冰点买入冷却期
 
+# v7: 分数历史（通道A 分数分位视图复用；每日 append，channel 取 5 年窗口）
+# 起点预热：预生成截至 start_date 的 60 个月频分数（近窗口起点分位视图
+# 立即生效，否则前 2 年分位不可用）
+from models.csi2000 import _monthly_score_history  # noqa: E402
+score_history_2000 = _monthly_score_history(
+    idx2000, idx300, macro, start_date)
+
+# 卖出事件锁：减仓是事件不是持续状态（2026-08-30 v7 修复）
+sold_once = {'300': False, '2000': False}
+
 print(f"\n{'='*60}")
-print(f"  开始逐月扫描: {start_date.date()} ~ {end_date.date()}")
-print(f"  共 {len(months)} 个月")
+print(f"  开始逐日扫描: {start_date.date()} ~ {end_date.date()}")
+print(f"  共 {len(days)} 个交易日")
 print(f"{'='*60}")
 
 signal_count = {'buy_300': 0, 'buy_2000': 0, 'sell': 0, 'skip_data': 0}
 
-for i, dt in enumerate(months):
-    # 获取当日指数点位
+for i, dt in enumerate(days):
     p300_rows = idx300[idx300['date'] <= dt]
     p2000_rows = idx2000[idx2000['date'] <= dt]
     if p300_rows.empty:
@@ -92,28 +106,30 @@ for i, dt in enumerate(months):
         continue
 
     p300_idx = float(p300_rows['close'].iloc[-1])
-
-    if p2000_rows.empty:
-        p2000_idx = 0
-    else:
-        p2000_idx = float(p2000_rows['close'].iloc[-1])
+    p2000_idx = float(p2000_rows['close'].iloc[-1])
 
     # 检测信号
     try:
-        ice = detect_ice_point(a, macro, dt)
+        ice = detect_ice_point(a, macro, dt, score_history_2000=score_history_2000)
         bubble = detect_bubble(a, macro, dt)
     except Exception as e:
         signal_count['skip_data'] += 1
         continue
+    # v7: 维护分数历史（仅月末最后交易日入池——与生产 60 个月频分位语义一致；
+    # 日频入池会让"5年分位"变成 11 年日频分位，2015 低波高分永久稀释近期分位）
+    if i + 1 >= len(days) or days.iloc[i + 1].month != dt.month:
+        score_history_2000.append((dt, ice['score_2000']))
 
-    # --- 泡沫卖出 ---
+    # --- 泡沫卖出（事件语义：确认日执行一次减仓，不每天减半；
+    # recovery 趋势修复后解锁，未来新泡沫可再卖）---
+    sold_today = False
     if bubble['is_bubble']:
         sell_pct = bubble.get('sell_pct', 0.5)
         for code, units, idx_price, r in [
             ('300', pos300_units, p300_idx, r300),
             ('2000', pos2000_units, p2000_idx, r2000),
         ]:
-            if units > 0 and idx_price > 0:
+            if units > 0 and idx_price > 0 and not sold_once[code]:
                 price = idx_price * r
                 sell_units = units * sell_pct
                 proceeds = sell_units * idx_price * r * 0.9998  # 扣除手续费
@@ -122,6 +138,7 @@ for i, dt in enumerate(months):
                     pos300_units -= sell_units
                 else:
                     pos2000_units -= sell_units
+                sold_once[code] = True
                 trades.append({
                     'date': dt, 'action': 'SELL', 'code': code,
                     'units': round(sell_units, 2), 'price': round(price, 4),
@@ -129,46 +146,61 @@ for i, dt in enumerate(months):
                     'reason': '; '.join(bubble.get('reasons', [])[:2])
                 })
                 signal_count['sell'] += 1
+                sold_today = True
+    elif bubble.get('recovery'):
+        sold_once['300'] = sold_once['2000'] = False
 
-    # --- 冰点买入 ---
-    for code, is_ice, idx_price, r, last_buy_ref, units_ref in [
-        ('300', ice['csi300'], p300_idx, r300, 'last_buy_300', 'pos300_units'),
-        ('2000', ice['csi2000'], p2000_idx, r2000, 'last_buy_2000', 'pos2000_units'),
-    ]:
-        if is_ice and cash > 5000 and idx_price > 0:
-            # 检查冷却期
-            lb = last_buy_300 if code == '300' else last_buy_2000
-            if lb is not None and (dt - lb).days < cooldown_days:
-                continue
+    # --- 冰点买入（资产比例目标 + 总持仓≤80% 上限：保留现金给后续冰点；
+    # 资产涨跌自动调节额度——上涨超配后停止买入，下跌释放额度）---
+    if not sold_today:
+        total_now = cash + pos300_units * p300_idx * r300 + pos2000_units * p2000_idx * r2000
+        held_now = total_now - cash
+        # v7: CSI2000 仓位按通道（A=40% / B=25%）× 动态乘数，封顶50%；CSI300 维持25%
+        for code, is_ice, idx_price, r, last_buy_ref, units_ref, buy_pct in [
+            ('300', ice['csi300'], p300_idx, r300, 'last_buy_300', 'pos300_units', 0.25),
+            ('2000', ice['csi2000'], p2000_idx, r2000, 'last_buy_2000', 'pos2000_units',
+             ice.get('position_pct_2000', 0.25)),
+        ]:
+            if is_ice and cash > 5000 and idx_price > 0:
+                # 检查冷却期
+                lb = last_buy_300 if code == '300' else last_buy_2000
+                if lb is not None and (dt - lb).days < cooldown_days:
+                    continue
 
-            # 每次用 25% 现金买入
-            amount = cash * 0.25
-            price = idx_price * r
-            units = amount / price
-            cost = amount * 1.0002  # 含手续费
+                # 目标=资产比例（通道仓位），受总持仓 80% 上限约束
+                avail = max(0.0, total_now * 0.80 - held_now)
+                amount = min(cash, total_now * buy_pct, avail)
+                if amount <= 0:
+                    continue
+                price = idx_price * r
+                units = amount / price
+                cost = amount * 1.0002  # 含手续费
 
-            if cost <= cash and units > 0:
-                cash -= cost
-                if code == '300':
-                    pos300_units += units
-                    last_buy_300 = dt
-                else:
-                    pos2000_units += units
-                    last_buy_2000 = dt
+                if cost <= cash and units > 0:
+                    cash -= cost
+                    if code == '300':
+                        pos300_units += units
+                        last_buy_300 = dt
+                    else:
+                        pos2000_units += units
+                        last_buy_2000 = dt
+                    held_now += amount
 
-                score_key = f'score_{code}'
-                trades.append({
-                    'date': dt, 'action': 'BUY', 'code': code,
-                    'units': round(units, 2), 'price': round(price, 4),
-                    'value': round(cost, 2),
-                    'score': ice.get(score_key, 0)
-                })
-                if code == '300':
-                    signal_count['buy_300'] += 1
-                else:
-                    signal_count['buy_2000'] += 1
+                    score_key = f'score_{code}'
+                    trades.append({
+                        'date': dt, 'action': 'BUY', 'code': code,
+                        'units': round(units, 2), 'price': round(price, 4),
+                        'value': round(cost, 2),
+                        'score': ice.get(score_key, 0),
+                        'pct': buy_pct,
+                        'channel': ice.get('channel_2000') if code == '2000' else None,
+                    })
+                    if code == '300':
+                        signal_count['buy_300'] += 1
+                    else:
+                        signal_count['buy_2000'] += 1
 
-    # 记录月末净值
+    # 记录净值（日频；后续按月取月末）
     total = cash + pos300_units * p300_idx * r300 + pos2000_units * p2000_idx * r2000
     monthly_records.append({
         'date': dt,
@@ -180,9 +212,9 @@ for i, dt in enumerate(months):
         'p2000': p2000_idx,
     })
 
-    # 进度
-    if (i+1) % 24 == 0:
-        print(f"  进度: {i+1}/{len(months)} ({dt.date()})  净值: {total:.0f}  信号: 买300={signal_count['buy_300']} 买2000={signal_count['buy_2000']} 卖={signal_count['sell']}")
+    # 进度（每 250 个交易日打印一次）
+    if (i+1) % 250 == 0:
+        print(f"  进度: {i+1}/{len(days)} ({dt.date()})  净值: {total:.0f}  信号: 买300={signal_count['buy_300']} 买2000={signal_count['buy_2000']} 卖={signal_count['sell']}")
 
 vals = pd.DataFrame(monthly_records)
 tdf = pd.DataFrame(trades) if trades else pd.DataFrame()
@@ -210,7 +242,7 @@ bm300_end_row = idx300[idx300['date'] <= vals['date'].iloc[-1]]
 bm300_end = float(bm300_end_row['close'].iloc[-1]) if not bm300_end_row.empty else bm300_start
 bm300_ret = bm300_end / bm300_start - 1
 
-start_2000_row = idx2000[idx2000['date'] >= idx2000['date'].min()]
+start_2000_row = idx2000[idx2000['date'] >= start_date]
 bm2000_start = float(start_2000_row.iloc[0]['close']) if not start_2000_row.empty else 1
 bm2000_end_row = idx2000[idx2000['date'] <= vals['date'].iloc[-1]]
 bm2000_end = float(bm2000_end_row['close'].iloc[-1]) if not bm2000_end_row.empty else bm2000_start
@@ -437,6 +469,8 @@ if not tdf.empty:
         note = ''
         if t['action'] == 'BUY' and 'score' in t:
             note = f"评分:{t['score']}"
+            if t.get('channel'):
+                note += f" · 通道{t['channel']} · 仓位{t.get('pct', 0.25):.0%}"
         elif t['action'] == 'SELL' and 'reason' in t:
             note = str(t['reason'])[:50]
         html += f'''      <tr>
