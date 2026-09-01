@@ -112,6 +112,32 @@ if __name__ == "__main__":
         print(f"\n  >>> {signal['position_advice']}")
         print(f"      CSI300: {signal['action_300']}  |  CSI2000: {signal['action_2000']}")
 
+        # ═══════════════════════════════════
+        # 机会雷达（卫星模型：核心之外的行业机会，独立不影响 300/2000）
+        # ═══════════════════════════════════
+        try:
+            from models.opportunity_radar import radar_scan
+            radar = radar_scan()
+            print(f"\n{'='*60}")
+            print(f"  🛰️ 机会雷达（行业机会 · 单标≤5% · 总卫星≤15%）")
+            print(f"{'='*60}")
+            if radar['opportunities']:
+                for o in radar['opportunities']:
+                    print(f"  🎯 {o['name']}({o['code']}) 收{o['price']:.3f} 参考买区{o['ref_buy_zone']} 仓位≤{o['pct']:.0%}")
+                    d = o['detail'].get('因子窗口', {})
+                    if d:
+                        print(f"     因子: 近20日{d.get('近20日涨幅','—')} 窗口{d.get('窗口','')}")
+                    d2 = o['detail'].get('行情确认', {})
+                    if d2:
+                        print(f"     行情: {d2.get('企稳','')} 量能{d2.get('量能5/20','')} {d2.get('距250日低点','')} {d2.get('启动区','')}")
+            else:
+                print(f"  😴 无机会——因子窗口+行情确认共振才会报")
+            for w in radar['watching']:
+                if any(('因子窗口未开' in m) or ('行情未确认' in m) for m in w['missing']):
+                    print(f"  👀 观察: {w['name']} 缺{'/'.join(w['missing'])}")
+        except Exception as e:
+            print(f"  ⚠️ 机会雷达: {str(e)[:60]}")
+
         if a_data.get('bond_yield_10y') is None:
             print(f"  ⚠️ 国债收益率数据缺失（所有新鲜源失效），ERP维度已跳过——宁缺毋滥，未使用停更数据")
 

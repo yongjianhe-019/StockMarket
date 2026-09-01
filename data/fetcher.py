@@ -218,7 +218,8 @@ def _sina_etf(code):
     url = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
            "CN_MarketData.getKLineData")
     r = requests.get(url, params={
-        "symbol": f"sz{code}", "scale": 240, "ma": "no", "datalen": 1023,
+        "symbol": f"{'sh' if code.startswith('5') else 'sz'}{code}", "scale": 240,
+        "ma": "no", "datalen": 1023,
     }, timeout=20); r.raise_for_status()
     data = json.loads(r.text)
     if not data:
@@ -250,9 +251,10 @@ def fetch_etf_daily(code, name, force=False):
     # 2) 东财补充（可选，失败不阻塞）
     if df is None:
         try:
-            secid_map = {"159330": "0.159330", "159531": "0.159531"}
+            # 深市基金 0.x / 沪市基金 1.x（东财 secid 格式）
+            secid = f"{'1' if code.startswith('5') else '0'}.{code}"
             url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
-                   f"?secid={secid_map[code]}&klt=101&fqt=1&beg=20230101"
+                   f"?secid={secid}&klt=101&fqt=1&beg=20150101"
                    f"&end={datetime.now().strftime('%Y%m%d')}"
                    "&fields1=f1,f2,f3,f4,f5,f6"
                    "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61")
