@@ -14,9 +14,30 @@
   C. 估值约束      行业PE分位<60%（防追高；数据链路可用后启用，缺数据时跳过并标注）
 
 输出:
-  opportunities: [{'name','code','date','factors','price','ref_buy_zone','pct','detail'}]
+  opportunities: [{'name','code','date','factors','price','ref_buy_zone','pct',
+                   'stop','tp','stop_pct','tp_pct','detail'}]
   watching:      [{'name','code','missing':[...]}]  # 接近触发但条件不全
+  exits:         [{'name','code','reason','exit_price','ret',...}]  # 触发的退出
   factor_status: {行业: {'factor','chg_20d','window'}}
+
+资金划分（核心 / 卫星）:
+  核心 沪深300 + 中证2000 —— 由各自模型独立决定仓位，本模型不干预
+  卫星 本雷达 —— 单标 ≤7.5%，总计 ≤15%（SATELLITE_SINGLE_PCT / SATELLITE_TOTAL_PCT）
+  硬约束 核心 + 卫星 ≤ 100%；卫星额度被占满后新信号降级为观察，不报机会
+  仓位 7.5% 的推导（实测 n=25，剔除证券）:
+       胜率 68.0%（90%CI 下界 52.7%）、盈亏比 1.63、盈亏平衡胜率 38.0%
+       → 全 Kelly 23.6%~48.4%，取 1/4 Kelly 区间中点 ≈ 7.5%
+       → 风险预算: 2 标×7.5%×5% 止损 = 组合最大损失 0.75%
+
+退出规则（与 backtest/radar_atr_stop_study.py 同口径，收盘价触发）:
+  止损 = max(2.5×ATR20, 5%)   止盈 = 2×止损   最长持有 60 交易日
+  为何用 ATR 而非固定 5%（2026-09-10 实测）:
+    横截面差异很小（信号日各标的 ATR 仅 1.77%~2.02%，1.14 倍）——**不是**理由；
+    真实理由是**时间维度**：单一标的自身 ATR 的 P90/P10 达 2.0~2.6 倍，
+    固定 5% 在不同 regime 相当于 0.52x~5.71x ATR，即同一规则的风险敞口浮动 10 倍。
+    30 个历史信号恰好全部落在中低波 regime，回测对两者不可区分
+    （低波组差 0.00%、高波组差 +0.06%），故 ATR 是**regime 稳健性**修正，
+    不是回测收益修正；5% 下限保证它在已验证样本上是空操作，只在高波 regime 激活。
 """
 
 from __future__ import annotations
@@ -26,6 +47,7 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -34,6 +56,17 @@ DATA_DIR = ROOT / "data"
 
 warnings.filterwarnings("ignore")
 
+# ── 资金划分与退出参数（依据见模块 docstring）──────────────
+SATELLITE_SINGLE_PCT = 0.075   # 单标仓位（1/4 Kelly 区间中点）
+SATELLITE_TOTAL_PCT = 0.15     # 卫星总仓位上限
+ATR_MULT = 2.5                 # 止损 = ATR_MULT × ATR20
+STOP_FLOOR = 0.05              # 止损下限（= 已验证口径，只放宽不收紧）
+TP_MULT = 2.0                  # 止盈 = TP_MULT × 止损
+MAX_HOLD_BARS = 60             # 最长持有交易日
+COOLDOWN_DAYS = 60             # 同标的冷却自然日
+
+STATE_FILE = DATA_DIR / "radar_state.json"
+
 # ── 行业池：code, name, 因子组 ─────────────────────────────
 # 因子组为 None → 两条件模式（B+C），有代理则三条件（A+B+C）
 ETF_POOL = [
@@ -41,7 +74,9 @@ ETF_POOL = [
     {"code": "159587", "name": "粮食",   "factors": ["M0", "SR0", "C0"]},
     {"code": "512400", "name": "有色",   "factors": ["CU0"]},              # 沪铜
     {"code": "515220", "name": "煤炭",   "factors": ["JM0"]},              # 焦煤
-    {"code": "512880", "name": "证券",   "factors": ["margin"]},           # 两融（管道已有）
+    # 证券 2026-09-10 降级：实证 n=5 胜率 0%（5个信号全部止损）。
+    # 机理：两融余额是月度存量慢变量，套用期货"20日涨幅>5%"的日频动量模板不成立。
+    {"code": "512880", "name": "证券",   "factors": None},
     {"code": "512480", "name": "半导体", "factors": None},                 # 无期货代理→两条件
     {"code": "512010", "name": "医药",   "factors": None},
     {"code": "512660", "name": "军工",   "factors": None},
@@ -143,19 +178,137 @@ def _confirm_signal(df: pd.DataFrame) -> tuple[bool, dict]:
 
 
 # ═══════════════════════════════════
+# 风险线 / 持仓状态 / 退出
+# ═══════════════════════════════════
+
+def _atr_pct(df: pd.DataFrame, n: int = 20) -> float | None:
+    """ATR(n) / 收盘价 —— 波动率的"当下水位"，用于自适应止损宽度。"""
+    if df is None or len(df) < n + 1:
+        return None
+    c = df["close"].values.astype(float)
+    h = df["high"].values.astype(float) if "high" in df.columns else c
+    l = df["low"].values.astype(float) if "low" in df.columns else c
+    pc = np.roll(c, 1)
+    pc[0] = c[0]
+    tr = np.maximum.reduce([h - l, np.abs(h - pc), np.abs(l - pc)])
+    atr = float(pd.Series(tr).rolling(n).mean().iloc[-1])
+    return atr / float(c[-1]) if c[-1] > 0 and not np.isnan(atr) else None
+
+
+def _risk_lines(px: float, atr_pct: float | None) -> dict:
+    """止损/止盈价。止损 = max(ATR_MULT×ATR, STOP_FLOOR)，止盈 = TP_MULT×止损。"""
+    sp = max(ATR_MULT * atr_pct, STOP_FLOOR) if atr_pct else STOP_FLOOR
+    tp_pct = sp * TP_MULT
+    return {
+        "stop_pct": round(sp, 4), "tp_pct": round(tp_pct, 4),
+        "stop": round(px * (1 - sp), 3), "tp": round(px * (1 + tp_pct), 3),
+    }
+
+
+def satellite_room(positions: list[dict]) -> float:
+    """卫星剩余可用额度（总上限 15% − 已占用）。"""
+    used = sum(float(p.get("pct", 0.0)) for p in positions)
+    return max(0.0, SATELLITE_TOTAL_PCT - used)
+
+
+def _load_state(path=None) -> dict:
+    """加载冷却记录 + 持仓。文件损坏时返回空状态（不阻断当日扫描）。"""
+    p = Path(path) if path else STATE_FILE
+    if not p.exists():
+        return {"last_signal": {}, "positions": []}
+    try:
+        s = json.loads(p.read_text(encoding="utf-8"))
+        s.setdefault("last_signal", {})
+        s.setdefault("positions", [])
+        return s
+    except Exception as e:
+        print(f"⚠ 雷达状态文件损坏({str(e)[:40]})，按空状态继续")
+        return {"last_signal": {}, "positions": []}
+
+
+def _save_state(state: dict, path=None) -> None:
+    p = Path(path) if path else STATE_FILE
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def close_position(code: str, reason: str = "手动", state_path=None) -> dict | None:
+    """手动平掉某标的的雷达持仓并返回它（无则 None）。
+
+    用于对账：信号报了但用户没实际买入，或用户已自行卖出。
+    不解除冷却——该信号已报过，避免平仓后立刻被重新建仓。
+    """
+    state = _load_state(state_path)
+    hit = next((p for p in state["positions"] if p.get("code") == code), None)
+    if hit is None:
+        return None
+    state["positions"] = [p for p in state["positions"] if p.get("code") != code]
+    _save_state(state, state_path)
+    return {**hit, "reason": reason}
+
+
+def check_exits(positions: list[dict], quotes: dict) -> tuple[list[dict], list[dict]]:
+    """逐日核对持仓：返回 (继续持有, 退出触发)。
+
+    收盘价触发（与回测同口径，不用盘中最高/最低）。优先级：止损 > 止盈 > 到期。
+    同一交易日重复扫描不重复计入持有天数（按 last_bar 去重）。
+    """
+    still, exits = [], []
+    for pos in positions:
+        p = dict(pos)
+        q = quotes.get(p.get("code"))
+        if not q or "close" not in q:
+            still.append(p)          # 数据缺失不得误判为退出
+            continue
+        px = float(q["close"])
+        bar = q.get("date")
+        if bar is None or bar != p.get("last_bar"):
+            p["bars_held"] = p.get("bars_held", 0) + 1
+            if bar is not None:
+                p["last_bar"] = bar
+
+        reason = None
+        if px <= p["stop"]:
+            reason = "止损"
+        elif px >= p["tp"]:
+            reason = "止盈"
+        elif p["bars_held"] >= MAX_HOLD_BARS:
+            reason = "到期"
+
+        if reason:
+            exits.append({**p, "reason": reason, "exit_price": px,
+                          "ret": round(px / p["entry"] - 1, 4)})
+        else:
+            still.append(p)
+    return still, exits
+
+
+# ═══════════════════════════════════
 # 主扫描
 # ═══════════════════════════════════
 
-def radar_scan(date=None) -> dict:
-    """全池扫描。返回 {opportunities, watching, factor_status}。"""
+def radar_scan(date=None, state_path=None) -> dict:
+    """全池扫描。返回 {opportunities, watching, exits, factor_status}。
+
+    持仓与冷却状态落盘到 state_path（默认 data/radar_state.json），
+    因此重复调用不会重复报同一信号（60 自然日冷却）。
+
+    传入 date= 进入**历史回放模式**：不读也不写状态文件——否则会用历史价格
+    去判定当前持仓的止损止盈，并把持有天数算乱。
+    """
     from data.fetcher import fetch_etf_daily
 
+    replay = date is not None
     factor_cache: dict = {}
     margin_df = _load_margin()
     opportunities, watching = [], []
     factor_status = {}
-    last_signal: dict = {}  # 冷却：同一标的历史信号日（回放时传入或内部维护）
-    today = pd.Timestamp(date) if date is not None else pd.Timestamp(datetime.now().date())
+    state = {"last_signal": {}, "positions": []} if replay else _load_state(state_path)
+    last_signal: dict = state["last_signal"]
+    positions: list[dict] = state["positions"]
+    room = satellite_room(positions)
+    quotes: dict = {}
+    today = pd.Timestamp(date) if replay else pd.Timestamp(datetime.now().date())
 
     for item in ETF_POOL:
         code, name, factors = item["code"], item["name"], item["factors"]
@@ -198,23 +351,39 @@ def radar_scan(date=None) -> dict:
 
         ok_b, det_b = _confirm_signal(df)
         px = float(df["close"].iloc[-1])
+        bar_date = str(df["date"].iloc[-1].date())
+        quotes[code] = {"close": px, "date": bar_date}
         detail = {}
         if det_a: detail["因子窗口"] = det_a
         detail["行情确认"] = det_b
 
         # 冷却：同一标的 60 自然日内已报过机会 → 不重复报（防连续多日刷屏）
         last_dt = last_signal.get(name)
-        in_cooldown = last_dt is not None and (today - last_dt).days < 60
+        last_dt = pd.Timestamp(last_dt) if last_dt else None
+        in_cooldown = last_dt is not None and (today - last_dt).days < COOLDOWN_DAYS
 
+        # 已持仓 → 始终展示（那是活仓，不是新信号；同一天重扫也不会消失）；
+        # 新信号 → 受 60 日冷却 与 卫星额度 双重约束
         # 机会只报"因子确认 + 行情确认"（A+B）；无因子行业（B-only）实证假信号
         # 率过高（军工-18%/医药-7%），降级为观察，不报机会
-        if factors and ok_a and ok_b and not in_cooldown:
-            last_signal[name] = today
+        held = next((p for p in positions if p.get("code") == code), None)
+        no_room = room < SATELLITE_SINGLE_PCT
+        if factors and ok_a and ok_b and (held is not None or (not in_cooldown and not no_room)):
+            if held is not None:
+                rl = {k: held[k] for k in ("stop", "tp", "stop_pct", "tp_pct")}
+            else:
+                rl = _risk_lines(px, _atr_pct(df))
+                last_signal[name] = bar_date
+                room -= SATELLITE_SINGLE_PCT
+                positions.append({
+                    "name": name, "code": code, "entry": px, "entry_date": bar_date,
+                    "pct": SATELLITE_SINGLE_PCT, "bars_held": 0, "last_bar": bar_date, **rl,
+                })
             opportunities.append({
-                "name": name, "code": code, "date": str(df["date"].iloc[-1].date()),
-                "factors": factors, "price": px,
+                "name": name, "code": code, "date": bar_date,
+                "factors": factors, "price": px, "held": held is not None,
                 "ref_buy_zone": f"{round(px * 0.97, 3)}~{round(px * 1.01, 3)}",
-                "pct": 0.05, "detail": detail,
+                "pct": SATELLITE_SINGLE_PCT, **rl, "detail": detail,
             })
         else:
             need = []
@@ -224,6 +393,16 @@ def radar_scan(date=None) -> dict:
                 if not ok_a: need.append("因子窗口未开")
                 if not ok_b: need.append("行情未确认")
                 if in_cooldown: need.append("冷却期内")
+                if no_room: need.append(f"卫星额度不足(剩{room:.1%})")
             need.extend(missing)
             watching.append({"name": name, "code": code, "missing": need or ["观察"]})
-    return {"opportunities": opportunities, "watching": watching, "factor_status": factor_status}
+
+    if replay:
+        return {"opportunities": opportunities, "watching": watching, "positions": [],
+                "exits": [], "factor_status": factor_status}
+
+    positions, exits = check_exits(positions, quotes)
+    state.update({"last_signal": last_signal, "positions": positions})
+    _save_state(state, state_path)
+    return {"opportunities": opportunities, "watching": watching, "positions": positions,
+            "exits": exits, "factor_status": factor_status}

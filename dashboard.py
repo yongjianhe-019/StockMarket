@@ -116,14 +116,21 @@ if __name__ == "__main__":
         # 机会雷达（卫星模型：核心之外的行业机会，独立不影响 300/2000）
         # ═══════════════════════════════════
         try:
-            from models.opportunity_radar import radar_scan
+            from models.opportunity_radar import (
+                SATELLITE_SINGLE_PCT, SATELLITE_TOTAL_PCT, radar_scan,
+            )
             radar = radar_scan()
             print(f"\n{'='*60}")
-            print(f"  🛰️ 机会雷达（行业机会 · 单标≤5% · 总卫星≤15%）")
+            print(f"  🛰️ 机会雷达（行业机会 · 单标≤{SATELLITE_SINGLE_PCT:.1%} · 总卫星≤{SATELLITE_TOTAL_PCT:.0%}）")
             print(f"{'='*60}")
             if radar['opportunities']:
                 for o in radar['opportunities']:
-                    print(f"  🎯 {o['name']}({o['code']}) 收{o['price']:.3f} 参考买区{o['ref_buy_zone']} 仓位≤{o['pct']:.0%}")
+                    tag = "持仓中" if o.get('held') else "新信号"
+                    print(f"  🎯 [{tag}] {o['name']}({o['code']}) 收{o['price']:.3f} 仓位≤{o['pct']:.1%}")
+                    print(f"     风控: 止损{o['stop']:.3f}({-o['stop_pct']:.2%}) 止盈{o['tp']:.3f}(+{o['tp_pct']:.2%}) 最长60交易日")
+                    if o.get('held'):
+                        continue
+                    print(f"     买区: {o['ref_buy_zone']}")
                     d = o['detail'].get('因子窗口', {})
                     if d:
                         print(f"     因子: 近20日{d.get('近20日涨幅','—')} 窗口{d.get('窗口','')}")
@@ -132,6 +139,17 @@ if __name__ == "__main__":
                         print(f"     行情: {d2.get('企稳','')} 量能{d2.get('量能5/20','')} {d2.get('距250日低点','')} {d2.get('启动区','')}")
             else:
                 print(f"  😴 无机会——因子窗口+行情确认共振才会报")
+
+            pos = radar.get('positions', [])
+            if pos:
+                used = sum(p['pct'] for p in pos)
+                print(f"  📌 卫星持仓 {len(pos)} 笔 / 占用 {used:.1%} / 上限 15%")
+                for p in pos:
+                    print(f"     {p['name']}({p['code']}) {p['entry_date']}@{p['entry']:.3f} "
+                          f"止损{p['stop']:.3f} 止盈{p['tp']:.3f} 持有{p['bars_held']}/60日")
+            for e in radar.get('exits', []):
+                print(f"  🚪 退出: {e['name']}({e['code']}) {e['reason']} @{e['exit_price']:.3f} "
+                      f"收益{e['ret']:+.2%}（{e['entry_date']}@{e['entry']:.3f} 入）")
             for w in radar['watching']:
                 if any(('因子窗口未开' in m) or ('行情未确认' in m) for m in w['missing']):
                     print(f"  👀 观察: {w['name']} 缺{'/'.join(w['missing'])}")
