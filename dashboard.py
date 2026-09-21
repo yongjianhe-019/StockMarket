@@ -11,7 +11,7 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 
-from data.fetcher import fetch_all_data, _load
+from data.fetcher import fetch_all_data, patch_csi2000_index, _load
 from macro.fetcher import fetch_all_macro
 from strategy import generate_signal, detect_ice_point, detect_bubble
 
@@ -33,31 +33,10 @@ if __name__ == "__main__":
         macro_df = fetch_all_macro(force=False)
 
         # 补全 CSI2000（近期段缺失时用 ETF 159531 反推指数）
-        # ratio = ETF价格/指数点位（重叠日实测）；反推指数 = ETF价格 / ratio（2026-08-28 修复: 曾误用 *ratio 产生4700倍断层）
-        idx2000 = a_data['csi2000_daily'].copy()
+        # 逻辑见 data/fetcher.patch_csi2000_index（监控脚本共用同一实现）
+        idx2000 = a_data['csi2000_daily'].copy()   # 补丁前的原始指数，供后续对照
         etf531 = a_data['etf_159531'].copy()
-        nd = etf531[~etf531['date'].isin(idx2000['date'])]
-        ratio_2000 = None
-        if len(nd) > 0:
-            ol = idx2000.merge(etf531[['date','close']].rename(columns={'close':'e'}), on='date', how='inner')
-            if ol.empty:
-                raise ValueError("CSI2000拼接: 与ETF无重叠日，无法计算换算比率")
-            ol = ol.assign(day_ratio=ol['e']/ol['close']).sort_values('date')
-            # 断言1: 相邻日换算比率变化应平稳（ETF折溢价漂移，日变化通常<1%；
-            # 全期CV含趋势漂移不适用，故用相邻日变化std）
-            day_ratio_chg = ol['day_ratio'].pct_change().dropna()
-            if day_ratio_chg.std() > 0.02:
-                raise ValueError(f"CSI2000拼接: 换算比率日变化异常 (std={day_ratio_chg.std():.2%})")
-            # ratio 取最近10个重叠日均值（贴近补丁段，实测反推误差<0.3%）
-            ratio_2000 = float(ol['day_ratio'].tail(10).mean())
-            nr = pd.DataFrame({'date':nd['date'],'open':nd['open']/ratio_2000,'close':nd['close']/ratio_2000,
-                               'high':nd['high']/ratio_2000,'low':nd['low']/ratio_2000,'volume':nd['volume']})
-            a_data['csi2000_daily'] = pd.concat([idx2000,nr]).sort_values('date').reset_index(drop=True)
-            # 断言2: 拼接点无跳变（换算正确时相邻两日对数收益应远小于50%）
-            jc = a_data['csi2000_daily']['close']
-            jump = float(abs(np.log(jc.iloc[len(idx2000)] / jc.iloc[len(idx2000)-1])))
-            if jump > 0.5:
-                raise ValueError(f"CSI2000拼接: 拼接点跳变 {jump:.0%}，换算比率疑似错误")
+        ratio_2000 = patch_csi2000_index(a_data)
 
         # ═══════════════════════════════════
         # 当前信号
@@ -111,6 +90,27 @@ if __name__ == "__main__":
 
         print(f"\n  >>> {signal['position_advice']}")
         print(f"      CSI300: {signal['action_300']}  |  CSI2000: {signal['action_2000']}")
+
+        # ═══════════════════════════════════
+        # 值得博弈的冰点买点（机会发现：R:R + 条件胜率 + EV + 企稳确认）
+        # 本质仍是冰点买入，但用性价比/期望值替代固定分数阈值；止盈另做
+        # ═══════════════════════════════════
+        try:
+            from models.opportunity_entry import scan as _scan_opp, missing_reasons as _miss, prep as _prep
+            print(f"\n{'='*60}")
+            print(f"  🎯 值得博弈的冰点买点（R:R + 条件胜率 + EV）")
+            print(f"{'='*60}")
+            for e in _scan_opp(a_data):
+                tag = "🟢 值得博弈" if e['eligible'] else "😴 暂不满足"
+                print(f"  {e['name']} {str(e['date'])[:10]} 收{e['close']:.3f} 回撤{e['dd']:.1%} {e['regime']} → {tag}")
+                print(f"     止损{e['stop']:.3f}(-{e['risk']/e['close']:.1%}) 目标{e['target']:.3f}(+{e['reward']/e['close']:.1%}) R:R={e['rr']:.2f}")
+                print(f"     胜率{e['win']:.0%}(Wilson{e['wilson']:.0%},n={e['n']}) EV={e['ev']:.1f} → 建议仓位{e['position_pct']:.0%}")
+                ma20 = float(_prep(a_data[e['code']]).iloc[-1]['ma20'])
+                miss = _miss(e, ma20)
+                if miss:
+                    print(f"     卡在: {'、'.join(miss)}")
+        except Exception as e:
+            print(f"  ⚠️ 机会发现: {str(e)[:60]}")
 
         # ═══════════════════════════════════
         # 机会雷达（卫星模型：核心之外的行业机会，独立不影响 300/2000）

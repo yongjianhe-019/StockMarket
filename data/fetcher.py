@@ -14,6 +14,7 @@ import json, logging, time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+import numpy as np
 import pandas as pd
 import requests
 
@@ -508,6 +509,49 @@ def fetch_bond_yield_10y():
 # ============================================================
 # 一键拉取
 # ============================================================
+
+def patch_csi2000_index(a_data: dict, etf_key: str = "etf_159531"):
+    """用 ETF 159531 反推补全 CSI2000 指数近期缺失段（就地修改 a_data）。
+
+    东财 CSI2000 指数源常滞后 1 天，而 ETF 是当天的。原先这段逻辑内联在
+    dashboard.py main 里，其他调用方（监控脚本）拿到的是滞后数据、模型会打
+    "非补丁路径请勿直接使用"。抽成共用函数后两边不会分叉。
+
+    ratio = ETF价格/指数点位（重叠日实测）；反推指数 = ETF价格 / ratio
+    （2026-08-28 修复: 曾误用 *ratio 产生 4700 倍断层）。
+
+    返回换算比率；指数已最新（无需补丁）时返回 None。
+    数据源异常（无重叠日 / 比率跳变 / 拼接点断层）抛 ValueError —— 宁缺毋滥。
+    """
+    idx2000 = a_data["csi2000_daily"].copy()
+    etf531 = a_data[etf_key].copy()
+    nd = etf531[~etf531["date"].isin(idx2000["date"])]
+    if len(nd) == 0:
+        return None
+
+    ol = idx2000.merge(etf531[["date", "close"]].rename(columns={"close": "e"}),
+                       on="date", how="inner")
+    if ol.empty:
+        raise ValueError("CSI2000拼接: 与ETF无重叠日，无法计算换算比率")
+    ol = ol.assign(day_ratio=ol["e"] / ol["close"]).sort_values("date")
+    # 断言1: 相邻日换算比率变化应平稳（ETF折溢价漂移，日变化通常<1%；
+    # 全期CV含趋势漂移不适用，故用相邻日变化std）
+    day_ratio_chg = ol["day_ratio"].pct_change().dropna()
+    if day_ratio_chg.std() > 0.02:
+        raise ValueError(f"CSI2000拼接: 换算比率日变化异常 (std={day_ratio_chg.std():.2%})")
+    # ratio 取最近10个重叠日均值（贴近补丁段，实测反推误差<0.3%）
+    ratio = float(ol["day_ratio"].tail(10).mean())
+    nr = pd.DataFrame({"date": nd["date"], "open": nd["open"] / ratio,
+                       "close": nd["close"] / ratio, "high": nd["high"] / ratio,
+                       "low": nd["low"] / ratio, "volume": nd["volume"]})
+    a_data["csi2000_daily"] = pd.concat([idx2000, nr]).sort_values("date").reset_index(drop=True)
+    # 断言2: 拼接点无跳变（换算正确时相邻两日对数收益应远小于50%）
+    jc = a_data["csi2000_daily"]["close"]
+    jump = float(abs(np.log(jc.iloc[len(idx2000)] / jc.iloc[len(idx2000) - 1])))
+    if jump > 0.5:
+        raise ValueError(f"CSI2000拼接: 拼接点跳变 {jump:.0%}，换算比率疑似错误")
+    return ratio
+
 
 def fetch_all_data(force=False):
     logger.info("==== 数据拉取 ====")
