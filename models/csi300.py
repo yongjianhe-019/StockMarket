@@ -25,6 +25,11 @@ SCORE_BUY = 80        # 65-80: 建仓; > 80: 补仓
 LOOKBACK_YEARS = 5
 TRADING_DAYS_PER_YEAR = 252
 
+# 分位窗口最少观测数（月频5年≈60；不足则维度降级，绝不静默回退全历史）
+MIN_WINDOW_OBS = 24
+# 估值新鲜度上限（日历日）：月频源月末+当月快照，超过一个月的余量即弃用
+VAL_MAX_STALE_DAYS = 45
+
 
 def _rolling_percentile(series: pd.Series, window: int) -> pd.Series:
     """滚动分位数（0~1），窗口不足时返回 NaN。"""
@@ -210,14 +215,24 @@ def compute_csi300_score(daily: pd.DataFrame,
     pe_latest = None
     if valuation is not None and not valuation.empty:
         val = valuation.copy()
-        pe_latest = float(val["pe"].dropna().iloc[-1]) if "pe" in val.columns else None
-        pb_latest = float(val["pb"].dropna().iloc[-1]) if "pb" in val.columns else None
+        # 新鲜度门：估值滞后超限 → 弃用（宁缺毋滥，不静默用停更/滞后数据）
+        val_date = pd.to_datetime(val["date"]).max()
+        stale_days = (latest_date - val_date).days
+        if stale_days > VAL_MAX_STALE_DAYS:
+            logger.warning("CSI300估值滞后 %d 天(>%d)，估值维度降级", stale_days, VAL_MAX_STALE_DAYS)
+            detail_v = {"状态": f"估值滞后{stale_days}天，已弃用"}
+        else:
+            pe_latest = float(val["pe"].dropna().iloc[-1]) if "pe" in val.columns else None
+            pb_latest = float(val["pb"].dropna().iloc[-1]) if "pb" in val.columns else None
 
-        if pe_latest is not None and pb_latest is not None and not (np.isnan(pe_latest) or np.isnan(pb_latest)):
-            window = LOOKBACK_YEARS * TRADING_DAYS_PER_YEAR
-            pe_pct = _compute_series_pct(val, "pe", window)
-            pb_pct = _compute_series_pct(val, "pb", window)
-            score_v, detail_v = score_valuation(pe_pct, pb_pct)
+            if pe_latest is not None and pb_latest is not None and not (np.isnan(pe_latest) or np.isnan(pb_latest)):
+                # 按日期取近5年分位（与数据频率无关；月频/日频都正确）
+                pe_pct = _window_pct(val, "pe", latest_date, LOOKBACK_YEARS)
+                pb_pct = _window_pct(val, "pb", latest_date, LOOKBACK_YEARS)
+                if pe_pct is not None and pb_pct is not None:
+                    score_v, detail_v = score_valuation(pe_pct, pb_pct)
+                else:
+                    detail_v = {"状态": "估值分位窗口不足，已降级"}
 
     # ---- 维度 2: 股债性价比 ----
     score_e, detail_e = 0.0, {"状态": "无法计算"}
@@ -235,10 +250,11 @@ def compute_csi300_score(daily: pd.DataFrame,
             merged["erp"] = (1 / merged["pe"] * 100) - merged["yield_10y"]
             merged = merged.dropna(subset=["erp"])
 
-            if len(merged) > 60:
-                window = LOOKBACK_YEARS * TRADING_DAYS_PER_YEAR
-                erp_pct = _compute_series_pct(merged, "erp", window)
+            erp_pct = _window_pct(merged, "erp", latest_date, LOOKBACK_YEARS)
+            if erp_pct is not None:
                 score_e, detail_e = score_erp(pe_latest, bond_latest, erp_pct)
+            else:
+                detail_e = {"状态": "ERP分位窗口不足，已降级"}
 
     # ---- 维度 3: 回撤深度 ----
     high_1y = float(daily["high"].tail(TRADING_DAYS_PER_YEAR).max())
@@ -278,8 +294,10 @@ def compute_csi300_score(daily: pd.DataFrame,
             merged["yield_10y"] = merged["yield_10y"].ffill()
             merged["erp"] = (1 / merged["pe"] * 100) - merged["yield_10y"]
             merged = merged.dropna(subset=["erp"])
-            if len(merged) > 252:
-                erp_5y = merged["erp"].tail(LOOKBACK_YEARS * TRADING_DAYS_PER_YEAR)
+            # 近5年 ERP 窗口（按日期，月频≈60观测；不足则不加分）
+            cut = latest_date - pd.Timedelta(days=int(365.25 * LOOKBACK_YEARS))
+            erp_5y = merged[merged["date"] >= cut]["erp"].dropna()
+            if len(erp_5y) >= MIN_WINDOW_OBS:
                 erp_mean = erp_5y.mean()
                 erp_std = erp_5y.std()
                 erp_2sigma = erp_mean + 2 * erp_std
@@ -373,13 +391,37 @@ def compute_csi300_score(daily: pd.DataFrame,
 
 
 def _compute_series_pct(df: pd.DataFrame, col: str, window: int) -> float:
-    """计算某列在给定窗口内的最新分位数 (0~1)。"""
+    """计算某列在给定窗口内的最新分位数 (0~1)。
+
+    仅用于**日频**序列（如成交量）。估值/ERP 等可能月频的序列必须用
+    `_window_pct` 按日期取窗，否则会因子频错配静默回退全历史。
+    """
     series = df[col].dropna()
     if len(series) < window:
         window = len(series)
     recent = series.tail(window)
     latest = recent.iloc[-1]
     return float((recent < latest).sum() / len(recent))
+
+
+def _window_pct(df: pd.DataFrame, col: str, end, years: int = LOOKBACK_YEARS):
+    """按**日期**取最近 `years` 年的分位 (0~1)，与数据频率无关。
+
+    返回 None 表示窗口观测不足（< MIN_WINDOW_OBS）——调用方必须降级该维度，
+    绝不静默回退到全历史（那会把"5年分位"算成"21年分位"，历史上曾导致
+    CSI300 分数虚增 25 分、假触发冰点）。
+    """
+    if df is None or df.empty or col not in df.columns:
+        return None
+    end = pd.Timestamp(end)
+    s = df[pd.to_datetime(df["date"]) <= end]
+    cut = end - pd.Timedelta(days=int(365.25 * years))
+    recent = s[pd.to_datetime(s["date"]) >= cut][col].dropna()
+    if len(recent) < MIN_WINDOW_OBS:
+        logger.warning("分位窗口不足: %s 近%d年仅%d个观测(<%d)，维度降级",
+                       col, years, len(recent), MIN_WINDOW_OBS)
+        return None
+    return float((recent < recent.iloc[-1]).mean())
 
 
 # ---------------------------------------------------------------------------
