@@ -32,6 +32,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+# PE 分位门槛的近5年窗口（按日期；月频源≈60观测，不足则门槛失效=不误开）
+PE_LOOKBACK_YEARS = 5
+PE_MIN_OBS = 24
+
 
 def is_bubble(macro_df: pd.DataFrame, csi300_val=None, csi2000_val=None,
               idx: int = -1, daily_300: pd.DataFrame = None,
@@ -531,14 +535,22 @@ def _check_trend_recovery(daily: pd.DataFrame, date, lookback: int = 250) -> boo
 
 
 def _pe_percentile(val_df, date):
-    """计算当前 PE 在历史上的分位数。"""
+    """当前 PE 在**近5年**历史中的分位（按日期取窗，与数据频率无关）。
+
+    注意：CSI300 估值源 legulegu 为**月频**（约258行/21.5年）。按行数取窗
+    （如 len<252 判定 + 全量分位）会静默回退成"21.5年分位"，把"偏贵"算成
+    "合理"——卖出门槛（PE>60%）该开不开。2026-09 实盘：21.5年口径 52.7% vs
+    正确5年口径 69.4%（>60% 门槛）。故必须按日期取窗，观测不足则返回 None。
+    """
     if val_df is None or val_df.empty:
         return None
-    v = val_df[val_df['date'] <= date]
+    end = pd.Timestamp(date)
+    v = val_df[pd.to_datetime(val_df['date']) <= end]
     if v.empty or 'pe' not in v.columns:
         return None
-    pe = v['pe'].dropna()
-    if len(pe) < 252:
+    cut = end - pd.Timedelta(days=int(365.25 * PE_LOOKBACK_YEARS))
+    pe = v[pd.to_datetime(v['date']) >= cut]['pe'].dropna()
+    if len(pe) < PE_MIN_OBS:
         return None
     pe_now = float(pe.iloc[-1])
     return float((pe < pe_now).sum() / len(pe))
