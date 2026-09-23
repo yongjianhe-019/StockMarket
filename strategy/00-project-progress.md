@@ -59,6 +59,7 @@
 - 动机：老冰点固定分数≥50（刻舟求剑）、不分标的、不算性价比
 - 框架 `models/opportunity_entry.py`：R:R + 条件胜率(walk-forward) + EV + 企稳(MA20) + 分数凯利
 - 接入 `dashboard.py`「🎯 值得博弈的冰点买点」+ 独立 `find_opportunity.py`
+- 盘中实时：`data/fetcher.fetch_realtime(codes)`（新浪源，非EOD）；`find_opportunity.py --live` 显示现价 vs MA20
 - 回测（沪深300，2023-10~2026-09，10%止盈半仓）：老冰点 +27.6%/-14.4%/7笔 → 新机会发现 **+31.9%/-13.7%/10笔**
 - 近3年按月：CSI300 +16.5%/-8.7%、CSI2000 +37.2%/-18.2%、组合 +27.2%/-12.1%
 - 样本外胜率：CSI300 45% / CSI2000 60%

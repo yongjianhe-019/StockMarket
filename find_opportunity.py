@@ -20,11 +20,40 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from data.fetcher import fetch_all_data, patch_csi2000_index  # noqa: E402
+from data.fetcher import fetch_all_data, patch_csi2000_index, fetch_realtime  # noqa: E402
 from macro.fetcher import fetch_all_macro  # noqa: E402
 from models.opportunity_entry import (  # noqa: E402
     RR_MIN, missing_reasons, prep, scan, scan_history,
 )
+
+# 标的 → ETF 代码（实时价用）
+ETF_OF = {"沪深300": "159330", "中证2000": "159531"}
+
+
+def live_block(a) -> None:
+    """盘中实时：现价 vs MA20，判断是否进入博弈买区。"""
+    try:
+        rt = fetch_realtime(list(ETF_OF.values()))
+    except Exception as e:  # noqa: BLE001
+        print(f"\n  ⚠️ 实时行情获取失败: {str(e)[:60]}")
+        return
+    if rt.empty:
+        return
+    rt = rt.set_index("code")
+    print(f"\n{'='*88}\n  🕐 实时行情（{rt['time'].iloc[0]}）")
+    for e in scan(a):
+        code = ETF_OF.get(e["name"])
+        if code not in rt.index:
+            continue
+        px = float(rt.loc[code, "price"])
+        chg = float(rt.loc[code, "change_pct"])
+        etf = a.get(f"etf_{code}")
+        if etf is None or etf.empty:
+            continue
+        ma20 = float(etf["close"].tail(20).mean())      # 用 ETF 自身均线，别拿指数比
+        dist = px / ma20 - 1
+        print(f"  {e['name']:<7} 现价{px:.3f} ({chg:+.2%})  MA20 {ma20:.3f}  距MA20 {dist:+.2%}"
+              f"  {'✅站上' if px > ma20 else '❌未站上'}")
 
 
 def main() -> int:
@@ -50,6 +79,9 @@ def main() -> int:
         if miss:
             print(f"    卡在: {'、'.join(miss)}")
         any_opp = any_opp or e["eligible"]
+
+    if "--live" in sys.argv:
+        live_block(a)
 
     if "--recent" in sys.argv:
         print(f"\n{'='*88}\n  最近 90 天触发记录")

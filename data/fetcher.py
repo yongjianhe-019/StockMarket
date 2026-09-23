@@ -573,3 +573,86 @@ def fetch_all_data(force=False):
 
     logger.info("==== 完成 ====")
     return r
+
+
+# ============================================================
+# 实时行情（盘中）
+# ============================================================
+
+# 新浪实时行情：ETF/指数代码 → sh/sz 前缀
+_SINA_SH_PREFIX = ("5", "6", "9", "11", "13", "18")   # 沪市 ETF/指数/债券
+_SINA_SZ_PREFIX = ("0", "1", "2", "3")                # 深市（含 159/399）
+
+
+def _sina_symbol(code: str) -> str:
+    """代码 → 新浪行情代码（自动加 sh/sz 前缀）。"""
+    c = str(code).strip()
+    if c.startswith("399") or c.startswith("159") or c.startswith("16"):
+        return "sz" + c
+    if c.startswith(("000", "932", "688", "6", "5", "11")):
+        return "sh" + c
+    return ("sh" if c[0] in "56" else "sz") + c
+
+
+def fetch_realtime(codes):
+    """拉取**盘中实时**行情（新浪 hq.sinajs.cn，非 EOD）。
+
+    Parameters
+    ----------
+    codes : list[str]
+        ETF / 指数代码，如 ["159531", "159330", "000300"]。
+
+    Returns
+    -------
+    DataFrame 列: code, name, open, prev_close, price, high, low,
+                  change_pct, volume, amount, time
+
+    注意
+    ----
+    - 返回的是**盘中价**，与模型用的**收盘价**不同；盘中信号会随后变化。
+    - 非交易时段返回的 price 可能是上一交易日收盘或 0（停牌/未开盘）。
+    - 新浪源偶有限流；失败抛异常，调用方自行兜底。
+    """
+    import requests
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:  # noqa: BLE001
+        pass
+
+    if isinstance(codes, str):
+        codes = [codes]
+    syms = ",".join(_sina_symbol(c) for c in codes)
+    url = f"https://hq.sinajs.cn/list={syms}"
+    r = requests.get(url, headers={"Referer": "https://finance.sina.com.cn"}, timeout=10)
+    r.raise_for_status()
+    r.encoding = "gbk"
+
+    rows = []
+    for line in r.text.strip().split("\n"):
+        if 'hq_str_' not in line or '="' not in line:
+            continue
+        sym = line.split("hq_str_")[1].split("=")[0]
+        code = sym[2:]
+        payload = line.split('="', 1)[1].rstrip('";')
+        f = payload.split(",")
+        if len(f) < 6:
+            continue
+        def _num(x):
+            try:
+                return float(x)
+            except (TypeError, ValueError):
+                return float("nan")
+        name, op, pc, cur, hi, lo = f[0], _num(f[1]), _num(f[2]), _num(f[3]), _num(f[4]), _num(f[5])
+        vol = _num(f[8]) if len(f) > 8 else float("nan")
+        amt = _num(f[9]) if len(f) > 9 else float("nan")
+        chg = (cur / pc - 1) if pc and pc > 0 else float("nan")
+        rows.append({
+            "code": code, "name": name, "open": op, "prev_close": pc,
+            "price": cur, "high": hi, "low": lo, "change_pct": chg,
+            "volume": vol, "amount": amt,
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return df

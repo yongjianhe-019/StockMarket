@@ -268,6 +268,7 @@ CSI300-only 组合回测（2018–2026）不劣化（+28.7% → +30.5%）。
 **近3年按月（10%止盈半仓）**：CSI300 +16.5%/-8.7%、CSI2000 +37.2%/-18.2%、组合 **+27.2%/-12.1%**。
 
 **接入**：`dashboard.py` 新增「🎯 值得博弈的冰点买点」区块；`find_opportunity.py` 独立扫描器（exit 1=有机会）。
+盘中：`data/fetcher.fetch_realtime(codes)`（新浪源）拉实时价，`find_opportunity.py --live` 显示现价 vs MA20。
 
 **测试**：`tests/test_opportunity_entry.py`（7 例）。
 
