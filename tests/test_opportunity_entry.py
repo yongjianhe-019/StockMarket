@@ -74,6 +74,20 @@ class TestWinTable(unittest.TestCase):
         self.assertAlmostEqual(p, 0.75)
         self.assertLessEqual(wlb, p)
 
+    def test_overlap_uses_effective_sample(self):
+        """v10: H=60 重叠窗口下 Wilson 下界按有效样本 n/H 计，不再过度自信。"""
+        from models.opportunity_entry import H, wilson_lb
+        n = H * 10
+        d = pd.DataFrame({
+            "dd_bucket": ["10-15%"] * n, "regime": ["risk_off"] * n,
+            "fwd": [0.1] * n,                      # 全胜
+        })
+        p, wlb, raw_n = win_table(d)[("10-15%", "risk_off")]
+        self.assertEqual(p, 1.0)
+        self.assertEqual(raw_n, n)                 # 展示仍用原始 n
+        self.assertAlmostEqual(wlb, wilson_lb(10, 10), places=6)  # n_eff = n/H = 10
+        self.assertLess(wlb, wilson_lb(n, n))      # 较原始口径显著更保守
+
 
 class TestPrepNoLookahead(unittest.TestCase):
     def test_features_use_past_only(self):

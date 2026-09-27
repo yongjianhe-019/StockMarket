@@ -67,13 +67,22 @@ def prep(daily: pd.DataFrame) -> pd.DataFrame:
 
 
 def win_table(d: pd.DataFrame) -> dict:
-    """条件胜率表：{(回撤档, regime): (胜率, Wilson下界, n)}。"""
+    """条件胜率表：{(回撤档, regime): (胜率, Wilson下界, n)}。
+
+    v10 重叠修正：前瞻窗口 H 日前瞻收益在日频上高度重叠（相邻样本共享
+    H-1 天），独立样本数 ≈ n/H。Wilson 下界若按原始 n 计算会**过度自信**
+    （n=532 实为 n_eff≈9），进而把凯利仓位放得过大。故下界改按有效样本
+    n_eff=round(n/H)、w_eff=round(w/H) 计算；点估计胜率 p 仍用全样本
+    （每个交易日的条件胜率是无偏的），raw n 一并保留供展示。
+    """
     t = {}
     for (dd, rg), g in d.dropna(subset=["fwd", "dd_bucket"]).groupby(
             ["dd_bucket", "regime"], observed=True):
         n = len(g)
         w = int((g["fwd"] > 0).sum())
-        t[(str(dd), rg)] = (w / n if n else 0.0, wilson_lb(w, n), n)
+        n_eff = max(1, int(round(n / H)))
+        w_eff = int(round(w / H))
+        t[(str(dd), rg)] = (w / n if n else 0.0, wilson_lb(w_eff, n_eff), n)
     return t
 
 
