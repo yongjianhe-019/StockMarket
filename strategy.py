@@ -13,7 +13,7 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 
-from models.csi300 import compute_csi300_score
+from models.csi300 import compute_csi300_score, _window_pct
 from models.csi2000 import compute_csi2000_score, csi2000_buy_channel
 from macro.sell_signal import is_bubble
 
@@ -92,17 +92,15 @@ def detect_ice_point(data: dict, macro_df: pd.DataFrame, date,
 
 
 def _get_pe_pct(val_df, date):
-    """当前 PE 在历史中的分位数。"""
-    if val_df is None or val_df.empty:
-        return None
-    v = val_df[val_df['date'] <= date]
-    if v.empty or 'pe' not in v.columns:
-        return None
-    pe = v['pe'].dropna()
-    if len(pe) < 252:
-        return None
-    pe_now = float(pe.iloc[-1])
-    return float((pe < pe_now).sum() / len(pe))
+    """当前 PE 在**近5年**历史中的分位（v8.2 修复）。
+
+    原实现按"全历史"取分位（legulegu 月频≈258行/21.5年），与模型内部
+    `compute_csi300_score` 及卖出端 `_pe_percentile` 的 5 年口径不一致，
+    把"偏贵"显示成"合理"（2026-09 实盘：全历史 50.8% vs 正确5年 70.5%，
+    仪表盘显示🟡合理、卖出理由却写"PE分位70%"，自相矛盾）。现统一走
+    `_window_pct`，口径与 v8/v8.1 对齐；观测不足返回 None（降级，不回退全历史）。
+    """
+    return _window_pct(val_df, "pe", date, years=5)
 
 
 # ═══════════════════════════════════

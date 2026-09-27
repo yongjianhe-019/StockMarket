@@ -96,5 +96,26 @@ class TestScoreUsesFiveYearWindow(unittest.TestCase):
         self.assertEqual(r["details"]["估值温度(30)"]["等级"], "不便宜")
 
 
+class TestStrategyPePctUses5yWindow(unittest.TestCase):
+    """v8.2: strategy._get_pe_pct(展示端 PE 分位) 也必须 5 年口径。"""
+
+    def test_get_pe_pct_matches_5y_not_full_history(self):
+        from strategy import _get_pe_pct
+        val = _monthly_valuation()
+        end = val["date"].iloc[-1]
+        p = _get_pe_pct(val, end)
+        self.assertAlmostEqual(p, _window_pct(val, "pe", end, years=5), places=6)
+        pfull = float((val["pe"] < val["pe"].iloc[-1]).mean())
+        self.assertGreater(p, 0.85)     # 5年口径：末值 8 在 5..8 中偏高
+        self.assertLess(pfull, 0.45)    # 全历史口径显著更低（旧实现会返回它）
+        self.assertNotAlmostEqual(p, pfull, places=2)
+
+    def test_get_pe_pct_insufficient_returns_none(self):
+        from strategy import _get_pe_pct
+        dates = pd.date_range("2026-01-01", periods=6, freq="MS")  # 仅6个月
+        df = pd.DataFrame({"date": dates, "pe": np.arange(6.0)})
+        self.assertIsNone(_get_pe_pct(df, dates[-1]))
+
+
 if __name__ == "__main__":
     unittest.main()
